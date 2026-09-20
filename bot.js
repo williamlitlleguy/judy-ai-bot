@@ -1075,6 +1075,13 @@ async function poll() {
 }
 
 async function main() {
+  // 🔑 اگر کلید هوش مصنوعی به‌صورت Secret محیطی باشد (HF/Render)، خودم فایل کانفیگ را می‌سازم
+  if (process.env.ZAI_CONFIG && !fs.existsSync('.z-ai-config')) {
+    try {
+      fs.writeFileSync(path.join(process.cwd(), '.z-ai-config'), process.env.ZAI_CONFIG);
+      console.log('🔑 کانفیگ هوش مصنوعی از Secret ساخته شد');
+    } catch (e) { console.error('⚠️ ساخت کانفیگ AI ناموفق:', e.message); }
+  }
   loadDB();
   zai = await ZAI.create();
   const me = await tg('getMe');
