@@ -1,0 +1,15 @@
+{
+  "name": "judy-telegram-bot",
+  "version": "2.2.0",
+  "description": "بات جودی — دستیار هوش مصنوعی تلگرام با حافظه، حافظه تصویری، پشتیبانی گروه و منوی شیشه‌ای",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node --dns-result-order=ipv4first bot.js"
+  },
+  "keywords": ["telegram", "bot", "ai", "chatbot", "persian"],
+  "license": "MIT",
+  "dependencies": {
+    "z-ai-web-dev-sdk": "^0.0.18"
+  }
+}
