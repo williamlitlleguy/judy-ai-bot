@@ -37,7 +37,7 @@ const REQUESTS_FILE = path.join(DATA_DIR, 'update-requests.json'); // صف در�
 const WELCOME_IMG = path.join(process.cwd(), 'assets', 'welcome.png');
 const MAX_HISTORY = 20; // حداکثر پیام‌هایی که حافظه نگه می‌دارد
 const VISION_MODEL = 'glm-4.5v'; // مدل بینایی ماشین برای دیدن عکس‌ها
-const BOT_VERSION = '2.3.0';
+const BOT_VERSION = '2.3.1';
 const OWNER_CHAT_ID = process.env.BOT_OWNER_ID || '5807801912'; // فقط ویل!
 const IMG_MODELS = ['glm-image', 'cogview-4', null]; // زنجیره مدل‌های تصویرساز: قوی‌تر ← جایگزین
 const GROUP_RANDOM_CHANCE = 0.08; // شانس پاسخ خودسرانه جودی در گروه‌ها (زنده بودن!)
@@ -254,11 +254,65 @@ async function askJudy(user, text, chatId = null, speaker = null) {
     } catch (e) {
       lastErr = e;
       console.error(`⚠️ تلاش ${attempt} برای پاسخ هوش مصنوعی ناموفق بود:`, e.message);
+      // اگر خطا اتصال شبکه باشد (هاست خارجی)، تلاش‌های بعدی بی‌فایده‌اند — مستقیم برو سراغ مغز جایگزین
+      const netErr = String(e?.message || e) + ' ' + String(e?.cause?.code || '');
+      if (/fetch failed|ConnectTimeout|ENOTFOUND|ECONNREFUSED|UND_ERR/i.test(netErr)) break;
       if (attempt < 3) await sleep(1000 * attempt);
     }
   }
   console.error('❌ هوش مصنوعی پاسخ نداد:', lastErr?.message);
-  return null;
+  // 🌐 تلاش با مغز جایگزین رایگان — وقتی گیت‌وای اصلی در دسترس نیست (مثلاً روی Render)
+  try {
+    const reply = await askPollinations(sys, user.history, text);
+    user.history.push({ role: 'user', content: text });
+    user.history.push({ role: 'assistant', content: reply });
+    if (user.history.length > MAX_HISTORY) user.history = user.history.slice(-MAX_HISTORY);
+    console.log('🌐 پاسخ با مغز جایگزین (Pollinations) داده شد');
+    return reply;
+  } catch (e2) {
+    console.error('❌ مغز جایگزین هم ناموفق بود:', e2.message);
+    return null;
+  }
+}
+
+// ══════════════════ 🌐 مغز جایگزین رایگان (Pollinations) ══════════════════
+// وقتی گیت‌وای اصلی در دسترس نباشد (هاست‌های خارجی مثل Render که به شبکه داخلی
+// دسترسی ندارند)، جودی با این مغز رایگان و بدون کلید جواب می‌دهد.
+
+const POLL_TEXT_URL = 'https://text.pollinations.ai/openai';
+const POLL_MODELS = ['openai', 'mistral'];
+
+async function askPollinations(sys, history, text) {
+  const msgs = [{ role: 'system', content: sys }, ...history, { role: 'user', content: text }];
+  let lastErr = null;
+  for (const model of POLL_MODELS) {
+    try {
+      const res = await fetch(POLL_TEXT_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, messages: msgs }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const reply = cleanAI(data?.choices?.[0]?.message?.content);
+      if (reply) return reply;
+      lastErr = new Error('پاسخ خالی');
+    } catch (e) {
+      lastErr = e;
+      console.error(`⚠️ مغز جایگزین «${model}» ناموفق:`, e.message);
+    }
+  }
+  throw lastErr || new Error('مغز جایگزین جواب نداد');
+}
+
+/** 🌐 ساخت عکس رایگان با Pollinations (بدون کلید) */
+async function pollinationsImageBuffer(prompt) {
+  const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=1024&height=1024&nologo=true`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Pollinations image HTTP ${res.status}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length < 1000) throw new Error('تصویر نامعتبر از Pollinations');
+  return buf;
 }
 
 // ══════════════════════════ منو و متن‌ها ══════════════════════════
@@ -592,10 +646,11 @@ async function generateImageBuffer(prompt, models = IMG_MODELS) {
 
 async function generateAndSendImage(chatId, user, prompt) {
   await sendText(chatId, `🎨 <b>دارم عکست را می‌سازم...</b>\n\n📝 ${esc(prompt)}\n\nبا مدل قوی‌تر و پرامپت حرفه‌ای! کمی صبر کن ⏳`);
+  let enhanced = prompt;
   try {
     await tg('sendChatAction', { chat_id: chatId, action: 'upload_photo' }).catch(() => {});
     // ۱) پرامپت حرفه‌ای: توضیح فارسی ← پرامپت انگلیسی غنی
-    const enhanced = await enrichPrompt(prompt);
+    enhanced = await enrichPrompt(prompt);
     // ۲) زنجیره مدل‌های قوی
     let result;
     try {
@@ -620,6 +675,24 @@ async function generateAndSendImage(chatId, user, prompt) {
     console.log(`🖼 عکس با مدل ${result.model} برای ${user.first_name} ساخته شد`);
   } catch (e) {
     console.error('❌ خطا در ساخت عکس:', String(e?.message || e));
+    // 🌐 تلاش با تصویرساز جایگزین رایگان (Pollinations / Flux)
+    try {
+      console.log('🌐 تلاش با تصویرساز جایگزین (Pollinations)...');
+      await tg('sendChatAction', { chat_id: chatId, action: 'upload_photo' }).catch(() => {});
+      const buf = await pollinationsImageBuffer(enhanced || prompt);
+      await tgUpload('sendPhoto', {
+        chat_id: chatId,
+        photo: buf,
+        __filename: 'judy-art.jpg',
+        caption: `🎨 <b>ساخته شد!</b> (مدل جایگزین Flux)\n\n📝 ${esc(prompt)}`,
+        reply_markup: JSON.stringify(imgMenu),
+      });
+      user.img_count = (user.img_count || 0) + 1;
+      saveDB();
+      return;
+    } catch (e2) {
+      console.error('⚠️ تصویرساز جایگزین هم ناموفق:', e2.message);
+    }
     if (isContentFilterError(e)) {
       await sendText(
         chatId,
@@ -640,9 +713,9 @@ async function generateAndSendImage(chatId, user, prompt) {
 
 /** دیدن عکس با مدل بینایی + ثبت در حافظه */
 async function seePhoto(chatId, user, photoBuffer) {
+  const dataUri = `data:image/jpeg;base64,${photoBuffer.toString('base64')}`;
   try {
     await tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
-    const dataUri = `data:image/jpeg;base64,${photoBuffer.toString('base64')}`;
     const res = await zai.chat.completions.createVision({
       model: VISION_MODEL,
       messages: [
@@ -663,7 +736,37 @@ async function seePhoto(chatId, user, photoBuffer) {
     await sendText(chatId, `👀 <b>دیدمش!</b>\n\n${fmt(desc)}`);
     return desc;
   } catch (e) {
-    console.error('⚠️ خطا در دیدن عکس:', e.message);
+    console.error('⚠️ خطا در دیدن عکس (اصلی):', e.message);
+    // 🌐 دیدن عکس با مغز جایگزین رایگان
+    try {
+      const res = await fetch(POLL_TEXT_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'openai',
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'text', text: 'این عکس را کاربر در تلگرام برای تو (جودی، یک دستیار دوستانه) فرستاده. اول در یک جمله کوتاه توصیفش کن، بعد یک واکنش دوستانه و جالب درباره‌اش بگو. فارسی صمیمی، حداکثر ۳ جمله.' },
+              { type: 'image_url', image_url: { url: dataUri } },
+            ],
+          }],
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const desc = cleanAI(data?.choices?.[0]?.message?.content);
+        if (desc) {
+          user.history.push({ role: 'user', content: '[کاربر یک عکس فرستاد]' });
+          user.history.push({ role: 'assistant', content: desc });
+          if (user.history.length > MAX_HISTORY) user.history = user.history.slice(-MAX_HISTORY);
+          await sendText(chatId, `👀 <b>دیدمش!</b>\n\n${fmt(desc)}`);
+          return desc;
+        }
+      }
+    } catch (e2) {
+      console.error('⚠️ دیدن عکس جایگزین هم ناموفق:', e2.message);
+    }
     return null;
   }
 }
