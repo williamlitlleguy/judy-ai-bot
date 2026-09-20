@@ -37,7 +37,7 @@ const REQUESTS_FILE = path.join(DATA_DIR, 'update-requests.json'); // صف در�
 const WELCOME_IMG = path.join(process.cwd(), 'assets', 'welcome.png');
 const MAX_HISTORY = 20; // حداکثر پیام‌هایی که حافظه نگه می‌دارد
 const VISION_MODEL = 'glm-4.5v'; // مدل بینایی ماشین برای دیدن عکس‌ها
-const BOT_VERSION = '2.4.1';
+const BOT_VERSION = '2.4.2';
 const OWNER_CHAT_ID = process.env.BOT_OWNER_ID || '5807801912'; // فقط ویل!
 const IMG_MODELS = ['glm-image', 'cogview-4', null]; // زنجیره مدل‌های تصویرساز: قوی‌تر ← جایگزین
 const GROUP_RANDOM_CHANCE = 0.08; // شانس پاسخ خودسرانه جودی در گروه‌ها (زنده بودن!)
@@ -347,26 +347,103 @@ async function askJudy(user, text, chatId = null, speaker = null) {
     }
   }
   console.error('❌ هوش مصنوعی پاسخ نداد:', lastErr?.message);
-  // 🌐 تلاش با مغز جایگزین رایگان — وقتی گیت‌وای اصلی در دسترس نیست (مثلاً روی Render)
+  // 🌐 زنجیره مغزهای جایگزین — Gemini → Groq → Pollinations (وقتی گیت‌وای اصلی در دسترس نیست)
+  for (const brain of [askGemini, askGroq, askPollinations]) {
+    try {
+      const reply = await brain(sys, user.history, text);
+      user.history.push({ role: 'user', content: text });
+      user.history.push({ role: 'assistant', content: reply });
+      if (user.history.length > MAX_HISTORY) user.history = user.history.slice(-MAX_HISTORY);
+      return reply;
+    } catch (e2) {
+      console.error(`⚠️ مغز جایگزین «${brain.name}» ناموفق:`, e2.message);
+    }
+  }
+  console.error('❌ همه مغزها ناموفق بودند');
+  return null;
+}
+
+// ══════════════════ 🌐 مغزهای جایگزین (خارج از شبکه داخلی) ══════════════════
+// وقتی گیت‌وای اصلی در دسترس نباشد (هاست‌های خارجی مثل Render که به شبکه داخلی
+// دسترسی ندارند)، جودی به ترتیب از این مغزها استفاده می‌کند:
+//   ۱) Gemini — رایگان با کلید Google AI Studio (aistudio.google.com/apikey) — env: GEMINI_API_KEY
+//   ۲) Groq — رایگان و بسیار سریع (console.groq.com/keys) — env: GROQ_API_KEY
+//   ۳) Pollinations — بدون کلید ولی ناپایدار (آخرین راه نجات)
+
+const POLL_TEXT_URL = 'https://text.pollinations.ai/openai';
+const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_CHAT_MODEL = 'gemini-2.5-flash';
+const GROQ_KEY = process.env.GROQ_API_KEY || '';
+const GROQ_MODEL = 'llama-3.3-70b-versatile';
+
+/** fetch با تایم‌اوت — هیچ مغزی نباید بات را معلق کند */
+async function fetchT(url, opts = {}, ms = 30000) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ms);
   try {
-    const reply = await askPollinations(sys, user.history, text);
-    user.history.push({ role: 'user', content: text });
-    user.history.push({ role: 'assistant', content: reply });
-    if (user.history.length > MAX_HISTORY) user.history = user.history.slice(-MAX_HISTORY);
-    console.log('🌐 پاسخ با مغز جایگزین (Pollinations) داده شد');
-    return reply;
-  } catch (e2) {
-    console.error('❌ مغز جایگزین هم ناموفق بود:', e2.message);
-    return null;
+    return await fetch(url, { ...opts, signal: ac.signal });
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-// ══════════════════ 🌐 مغز جایگزین رایگان (Pollinations) ══════════════════
-// وقتی گیت‌وای اصلی در دسترس نباشد (هاست‌های خارجی مثل Render که به شبکه داخلی
-// دسترسی ندارند)، جودی با این مغز رایگان و بدون کلید جواب می‌دهد.
+/** تبدیل حافظه به فرمت Gemini */
+function toGeminiContents(history, text) {
+  const contents = history
+    .filter(m => m.role === 'user' || m.role === 'assistant')
+    .map(m => ({ role: m.role === 'user' ? 'user' : 'model', parts: [{ text: String(m.content) }] }));
+  contents.push({ role: 'user', parts: [{ text }] });
+  return contents;
+}
 
-const POLL_TEXT_URL = 'https://text.pollinations.ai/openai';
-const POLL_MODELS = ['openai', 'mistral'];
+/** 🧠 مغز Gemini — چت فارسی باکیفیت + رایگان با کلید Google AI Studio */
+async function askGemini(sys, history, text) {
+  if (!GEMINI_KEY) throw new Error('کلید Gemini تنظیم نشده');
+  const res = await fetchT(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_CHAT_MODEL}:generateContent?key=${GEMINI_KEY}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: sys }] },
+        contents: toGeminiContents(history, text),
+        generationConfig: { temperature: 0.85, maxOutputTokens: 2048, thinkingConfig: { thinkingBudget: 0 } },
+      }),
+    },
+    35000
+  );
+  if (!res.ok) throw new Error(`Gemini HTTP ${res.status}`);
+  const data = await res.json();
+  const reply = cleanAI((data?.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join(''));
+  if (!reply) throw new Error('Gemini پاسخ خالی');
+  console.log('🧠 پاسخ با مغز Gemini داده شد');
+  return reply;
+}
+
+/** 🧠 مغز Groq — بسیار سریع و رایگان با کلید console.groq.com */
+async function askGroq(sys, history, text) {
+  if (!GROQ_KEY) throw new Error('کلید Groq تنظیم نشده');
+  const res = await fetchT(
+    'https://api.groq.com/openai/v1/chat/completions',
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${GROQ_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages: [{ role: 'system', content: sys }, ...history, { role: 'user', content: text }],
+        max_tokens: 1200,
+        temperature: 0.85,
+      }),
+    },
+    35000
+  );
+  if (!res.ok) throw new Error(`Groq HTTP ${res.status}`);
+  const data = await res.json();
+  const reply = cleanAI(data?.choices?.[0]?.message?.content);
+  if (!reply) throw new Error('Groq پاسخ خالی');
+  console.log('🧠 پاسخ با مغز Groq داده شد');
+  return reply;
+}
 
 /** تشخیص قطعی گیت‌وای اصلی — ۳۰ دقیقه از جایگزین استفاده می‌شود */
 let primaryDownUntil = 0;
@@ -380,33 +457,39 @@ function markPrimaryDown(err) {
   return false;
 }
 
+/** 🌐 مغز نجات Pollinations — بدون کلید، با تایم‌اوت و تلاش مجدد برای صف/خطای سرور */
 async function askPollinations(sys, history, text) {
   const msgs = [{ role: 'system', content: sys }, ...history, { role: 'user', content: text }];
   let lastErr = null;
-  for (const model of POLL_MODELS) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const res = await fetch(POLL_TEXT_URL, {
+      const res = await fetchT(POLL_TEXT_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, messages: msgs }),
-      });
+        body: JSON.stringify({ model: 'openai-fast', messages: msgs }),
+      }, 30000);
+      if (res.status === 429 || res.status >= 500) throw new Error(`HTTP ${res.status} — صف/سرور شلوغ`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const reply = cleanAI(data?.choices?.[0]?.message?.content);
-      if (reply) return reply;
+      if (reply) {
+        console.log('🌐 پاسخ با مغز Pollinations داده شد');
+        return reply;
+      }
       lastErr = new Error('پاسخ خالی');
     } catch (e) {
       lastErr = e;
-      console.error(`⚠️ مغز جایگزین «${model}» ناموفق:`, e.message);
+      console.error(`⚠️ Pollinations تلاش ${attempt} ناموفق:`, e.message);
     }
+    if (attempt < 3) await sleep(4000 * attempt);
   }
-  throw lastErr || new Error('مغز جایگزین جواب نداد');
+  throw lastErr || new Error('Pollinations جواب نداد');
 }
 
 /** 🌐 ساخت عکس رایگان با Pollinations (بدون کلید) */
 async function pollinationsImageBuffer(prompt) {
   const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=1024&height=1024&nologo=true`;
-  const res = await fetch(url);
+  const res = await fetchT(url, {}, 120000);
   if (!res.ok) throw new Error(`Pollinations image HTTP ${res.status}`);
   const buf = Buffer.from(await res.arrayBuffer());
   if (buf.length < 1000) throw new Error('تصویر نامعتبر از Pollinations');
@@ -747,22 +830,68 @@ async function generateImageBuffer(prompt, models = IMG_MODELS) {
 async function translatePromptEn(prompt) {
   if (/^[\x00-\x7F\s\d]*$/.test(prompt)) return prompt; // قبلاً انگلیسی است
   try {
-    const res = await fetch(POLL_TEXT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'openai',
-        messages: [
-          { role: 'system', content: 'Translate the user image description into ONE vivid English image prompt. Output ONLY the prompt text, max 60 words, safe-for-work, no quotes.' },
-          { role: 'user', content: prompt },
-        ],
-      }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      const out = cleanAI(data?.choices?.[0]?.message?.content);
-      if (out) return out;
+    // ترجمه: Gemini → Groq → Pollinations — اولی که جواب داد
+    let out = '';
+    if (GEMINI_KEY) {
+      try {
+        const res = await fetchT(
+          `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_CHAT_MODEL}:generateContent?key=${GEMINI_KEY}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ role: 'user', parts: [{ text: `Translate this Persian image description into ONE vivid English image prompt. Output ONLY the prompt text, max 60 words, safe-for-work, no quotes:\n${prompt}` }] }],
+              generationConfig: { temperature: 0.4, maxOutputTokens: 200, thinkingConfig: { thinkingBudget: 0 } },
+            }),
+          },
+          20000
+        );
+        if (res.ok) {
+          const data = await res.json();
+          out = cleanAI((data?.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join(''));
+        }
+      } catch { /* مغز بعدی */ }
     }
+    if (!out && GROQ_KEY) {
+      try {
+        const res = await fetchT('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${GROQ_KEY}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: GROQ_MODEL,
+            messages: [
+              { role: 'system', content: 'Translate the user image description into ONE vivid English image prompt. Output ONLY the prompt text, max 60 words, safe-for-work, no quotes.' },
+              { role: 'user', content: prompt },
+            ],
+            max_tokens: 200,
+          }),
+        }, 20000);
+        if (res.ok) {
+          const data = await res.json();
+          out = cleanAI(data?.choices?.[0]?.message?.content);
+        }
+      } catch { /* مغز بعدی */ }
+    }
+    if (!out) {
+      try {
+        const res = await fetchT(POLL_TEXT_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'openai-fast',
+            messages: [
+              { role: 'system', content: 'Translate the user image description into ONE vivid English image prompt. Output ONLY the prompt text, max 60 words, safe-for-work, no quotes.' },
+              { role: 'user', content: prompt },
+            ],
+          }),
+        }, 25000);
+        if (res.ok) {
+          const data = await res.json();
+          out = cleanAI(data?.choices?.[0]?.message?.content);
+        }
+      } catch { /* پرامپت خام بماند */ }
+    }
+    if (out) return out;
   } catch { /* پرامپت خام بماند */ }
   return prompt;
 }
@@ -841,37 +970,43 @@ async function generateAndSendImage(chatId, user, prompt) {
   }
 }
 
-/** 👀 دیدن عکس با مغز جایگزین رایگان (وقتی گیت‌وای اصلی پایین است) */
+/** 👀 دیدن عکس با مغز Gemini (وقتی گیت‌وای اصلی پایین است) */
 async function seePhotoFallback(chatId, user, dataUri) {
   try {
-    const res = await fetch(POLL_TEXT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'openai',
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'text', text: 'این عکس را کاربر در تلگرام برای تو (جودی، یک دستیار دوستانه) فرستاده. اول در یک جمله کوتاه توصیفش کن، بعد یک واکنش دوستانه و جالب درباره‌اش بگو. فارسی صمیمی، حداکثر ۳ جمله.' },
-            { type: 'image_url', image_url: { url: dataUri } },
-          ],
-        }],
-      }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      const desc = cleanAI(data?.choices?.[0]?.message?.content);
-      if (desc) {
-        user.history.push({ role: 'user', content: '[کاربر یک عکس فرستاد]' });
-        user.history.push({ role: 'assistant', content: desc });
-        if (user.history.length > MAX_HISTORY) user.history = user.history.slice(-MAX_HISTORY);
-        await sendText(chatId, `👀 <b>دیدمش!</b>\n\n${fmt(desc)}`);
-        return desc;
-      }
-    }
+    if (!GEMINI_KEY) throw new Error('کلید Gemini تنظیم نشده');
+    const b64 = dataUri.split(',')[1] || '';
+    const res = await fetchT(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_CHAT_MODEL}:generateContent?key=${GEMINI_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{
+            role: 'user',
+            parts: [
+              { text: 'این عکس را کاربر در تلگرام برای تو (جودی، یک دستیار دوستانه) فرستاده. اول در یک جمله کوتاه توصیفش کن، بعد یک واکنش دوستانه و جالب درباره‌اش بگو. فارسی صمیمی، حداکثر ۳ جمله.' },
+              { inline_data: { mime_type: 'image/jpeg', data: b64 } },
+            ],
+          }],
+          generationConfig: { temperature: 0.8, maxOutputTokens: 600, thinkingConfig: { thinkingBudget: 0 } },
+        }),
+      },
+      40000
+    );
+    if (!res.ok) throw new Error(`Gemini HTTP ${res.status}`);
+    const data = await res.json();
+    const desc = cleanAI((data?.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join(''));
+    if (!desc) throw new Error('پاسخ خالی');
+    console.log('🧠 عکس با مغز Gemini دیده شد');
+    user.history.push({ role: 'user', content: '[کاربر یک عکس فرستاد]' });
+    user.history.push({ role: 'assistant', content: desc });
+    if (user.history.length > MAX_HISTORY) user.history = user.history.slice(-MAX_HISTORY);
+    await sendText(chatId, `👀 <b>دیدمش!</b>\n\n${fmt(desc)}`);
+    return desc;
   } catch (e2) {
-    console.error('⚠️ دیدن عکس جایگزین هم ناموفق:', e2.message);
+    console.error('⚠️ دیدن عکس (Gemini) ناموفق:', e2.message);
   }
+  await sendText(chatId, `👀 <b>الان نمی‌توانم عکس را ببینم!</b>\nسرویس بینایی در دسترس نیست — ولی می‌توانی درباره‌اش برایم توضیح بدهی یا باهام حرف بزنی! 😊`);
   return null;
 }
 
@@ -1359,7 +1494,7 @@ async function handleMessage(msg) {
     const reply = await askJudy(user, chatText, chatId, from);
     saveDB();
     if (reply) await sendText(chatId, isGroup ? `👤 ${esc(from.first_name)}\n${fmt(reply)}` : fmt(reply));
-    else await sendText(chatId, `😔 متأسفانه الان نمی‌توانم جواب بدهم. یک بار دیگر امتحان کن!`);
+    else await sendText(chatId, `😔 متأسفانه الان هیچ‌کدام از مغزهای من در دسترس نیست!\nسرویس‌های رایگان شلوغند — چند لحظه بعد دوباره امتحان کن 🙏`);
   }
 }
 
