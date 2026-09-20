@@ -37,7 +37,7 @@ const REQUESTS_FILE = path.join(DATA_DIR, 'update-requests.json'); // صف در�
 const WELCOME_IMG = path.join(process.cwd(), 'assets', 'welcome.png');
 const MAX_HISTORY = 20; // حداکثر پیام‌هایی که حافظه نگه می‌دارد
 const VISION_MODEL = 'glm-4.5v'; // مدل بینایی ماشین برای دیدن عکس‌ها
-const BOT_VERSION = '2.2.1';
+const BOT_VERSION = '2.3.0';
 const OWNER_CHAT_ID = process.env.BOT_OWNER_ID || '5807801912'; // فقط ویل!
 const IMG_MODELS = ['glm-image', 'cogview-4', null]; // زنجیره مدل‌های تصویرساز: قوی‌تر ← جایگزین
 const GROUP_RANDOM_CHANCE = 0.08; // شانس پاسخ خودسرانه جودی در گروه‌ها (زنده بودن!)
@@ -733,6 +733,154 @@ function saveUpdateRequest(note, user, chatId, groupName = null) {
   console.log(`📣📣📣 درخواست آپدیت جدید از ${req.from_name}: ${note}`);
 }
 
+// ══════════════════ 🔐 پنل ادمین — دیتابیس (فقط خود ویل) ══════════════════
+
+const DB_PAGE_SIZE = 6;  // تعداد کاربر در هر صفحه‌ی منوی کشویی
+const DB_MSG_CHUNK = 16; // تعداد پیام در پیش‌نمایش مکالمه‌ی هر کاربر
+
+/** لیست کاربران — تازه‌ترین عضو اول */
+function adminUserList() {
+  return Object.entries(db.users)
+    .sort((a, b) => new Date(b[1].joined_at || 0) - new Date(a[1].joined_at || 0));
+}
+
+/** 📋 دستور db — لیست متنی تمام کاربران با جزئیات */
+async function adminListUsers(chatId) {
+  const users = adminUserList();
+  if (!users.length) {
+    await sendText(chatId, `🗄 <b>دیتابیس جودی</b>\n\n📭 هنوز هیچ کاربری ثبت نشده است.`);
+    return;
+  }
+  let totalMsgs = 0, totalFiles = 0;
+  const lines = users.map(([cid, u], i) => {
+    totalMsgs += u.msg_count || 0;
+    totalFiles += u.files?.length || 0;
+    const tag = u.is_group ? '👥 گروه' : '👤 کاربر';
+    return (
+      `${i + 1}. ${tag} — <b>${esc(u.title || u.first_name || 'بی‌نام')}</b>\n` +
+      `   ├ یوزرنیم: ${u.username ? '@' + esc(u.username) : '—'}\n` +
+      `   ├ آیدی: <code>${cid}</code>\n` +
+      `   ├ پیام: ${u.msg_count || 0} | فایل: ${u.files?.length || 0} | حافظه: ${(u.history || []).length}\n` +
+      `   └ عضویت: ${faDate(u.joined_at)}`
+    );
+  }).join('\n\n');
+  await sendText(
+    chatId,
+    `🗄 <b>دیتابیس جودی</b> — نسخه ${BOT_VERSION}\n\n` +
+    `👥 کل: <b>${users.length}</b> | 💬 پیام‌ها: <b>${totalMsgs}</b> | 📁 فایل‌ها: <b>${totalFiles}</b>\n\n` +
+    lines
+  );
+}
+
+/** 🎛 کیبورد کشویی کاربران (dball) */
+function adminUsersKeyboard(page) {
+  const users = adminUserList();
+  const totalPages = Math.max(1, Math.ceil(users.length / DB_PAGE_SIZE));
+  page = Math.max(0, Math.min(page, totalPages - 1));
+  const rows = users.slice(page * DB_PAGE_SIZE, page * DB_PAGE_SIZE + DB_PAGE_SIZE)
+    .map(([cid, u], i) => {
+      const n = page * DB_PAGE_SIZE + i + 1;
+      const name = (u.title || u.first_name || 'بی‌نام').slice(0, 18);
+      const label = `${u.is_group ? '👥' : '👤'} ${n}. ${name} — ${u.msg_count || 0} پیام`;
+      return [{ text: label, callback_data: `dbu_${cid}_${page}` }];
+    });
+  const nav = [];
+  if (page > 0) nav.push({ text: '◀️ قبلی', callback_data: `dbp_${page - 1}` });
+  nav.push({ text: `📄 ${page + 1} از ${totalPages}`, callback_data: 'dbno' });
+  if (page < totalPages - 1) nav.push({ text: 'بعدی ▶️', callback_data: `dbp_${page + 1}` });
+  if (nav.length) rows.push(nav);
+  return { rows, total: users.length, page, totalPages };
+}
+
+/** 🎛 دستور dball — منوی کشویی کاربران (در همان پیام می‌لغزد!) */
+async function adminUsersMenu(chatId, page = 0, msgId = null) {
+  const { rows, total, page: p } = adminUsersKeyboard(page);
+  if (!total) {
+    await sendText(chatId, `🎛 <b>پنل کاربران</b>\n\n📭 هنوز هیچ کاربری ثبت نشده است.`);
+    return;
+  }
+  const text =
+    `🎛 <b>پنل کشویی کاربران — دیتابیس جودی</b>\n` +
+    `👥 کل: <b>${total}</b> نفر\n\n` +
+    `روی هر کاربر بزن تا مکالمه‌اش را ببینی 👇`;
+  const markup = { inline_keyboard: rows };
+  if (msgId) {
+    try {
+      await tg('editMessageText', { chat_id: chatId, message_id: msgId, text, parse_mode: 'HTML', reply_markup: markup });
+      return;
+    } catch { /* ادیت نشد → پیام جدید می‌فرستیم */ }
+  }
+  await sendText(chatId, text, markup);
+}
+
+/** 💬 نمایش مکالمه یک کاربر — داخل همان پیام کشویی */
+async function adminShowUser(chatId, targetId, page, msgId = null) {
+  const u = db.users[String(targetId)];
+  if (!u) {
+    await sendText(chatId, `🤔 این کاربر در دیتابیس پیدا نشد! دوباره dball را بزن.`);
+    return;
+  }
+  const h = u.history || [];
+  const header =
+    `💬 <b>${u.is_group ? '👥 ' : ''}${esc(u.title || u.first_name || 'بی‌نام')}</b>` +
+    `${u.username ? ` (@${esc(u.username)})` : ''}\n` +
+    `🆔 <code>${targetId}</code> | عضویت: ${faDate(u.joined_at)}\n` +
+    `📊 پیام‌ها: ${u.msg_count || 0} | 📁 فایل‌ها: ${u.files?.length || 0} | 🧠 حافظه: ${h.length} پیام\n` +
+    `━━━━━━━━━━━━━━━━━━\n`;
+  let body = '';
+  let hidden = 0;
+  if (h.length) {
+    const entries = h.slice(-DB_MSG_CHUNK).map((m) =>
+      m.role === 'user'
+        ? `👤 <b>${esc((u.first_name || 'کاربر').slice(0, 20))}:</b> ${esc(String(m.content || '')).slice(0, 350)}`
+        : `🤖 <b>جودی:</b> ${esc(String(m.content || '')).slice(0, 350)}`
+    );
+    for (let i = entries.length - 1; i >= 0; i--) {
+      if (body.length + entries[i].length > 3400) { hidden = i + 1; break; }
+      body = entries[i] + (body ? '\n\n' + body : '');
+    }
+    if (hidden > 0) body = `… ${hidden} پیام قدیمی‌تر حذف شد (برای دیدن کامل، دکمه پایین را بزن)\n\n` + body;
+    else if (h.length > entries.length) body = `… ${h.length - entries.length} پیام قدیمی‌تر حذف شد\n\n` + body;
+  } else {
+    body = '📭 هنوز مکالمه‌ای در حافظه نیست.';
+  }
+  const rows = [];
+  if (h.length) rows.push([{ text: `📜 مکالمه کامل (${h.length} پیام)`, callback_data: `dbf_${targetId}_${page}` }]);
+  rows.push([{ text: '🔙 بازگشت به لیست', callback_data: `dbp_${page}` }]);
+  const text = header + body;
+  if (msgId) {
+    try {
+      await tg('editMessageText', { chat_id: chatId, message_id: msgId, text, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+      return;
+    } catch { /* ادیت نشد → پیام جدید */ }
+  }
+  await sendText(chatId, text, { inline_keyboard: rows });
+}
+
+/** 📜 مکالمه کامل یک کاربر — پیام جداگانه (تکه‌تکه) */
+async function adminShowUserFull(chatId, targetId, page) {
+  const u = db.users[String(targetId)];
+  if (!u) {
+    await sendText(chatId, `🤔 این کاربر در دیتابیس پیدا نشد! دوباره dball را بزن.`);
+    return;
+  }
+  const h = u.history || [];
+  if (!h.length) {
+    await sendText(chatId, `📭 مکالمه‌ای برای نمایش نیست.`);
+    return;
+  }
+  const conv = h.map((m) =>
+    m.role === 'user'
+      ? `👤 <b>${esc((u.first_name || 'کاربر').slice(0, 20))}:</b> ${esc(String(m.content || ''))}`
+      : `🤖 <b>جودی:</b> ${esc(String(m.content || ''))}`
+  ).join('\n\n');
+  await sendText(
+    chatId,
+    `📜 <b>مکالمه کامل ${esc(u.title || u.first_name || 'بی‌نام')}</b> — ${h.length} پیام ذخیره‌شده\n\n${conv}`,
+    { inline_keyboard: [[{ text: '🔙 بازگشت به لیست', callback_data: `dbp_${page}` }]] }
+  );
+}
+
 // ══════════════════════════ هندلر پیام‌ها ══════════════════════════
 
 async function handleStart(chatId, from, user) {
@@ -908,6 +1056,23 @@ async function handleMessage(msg) {
     }
   }
 
+  // 🔐 دستورهای مخفی سازنده — فقط خود ویل در چت خصوصی (db و dball)
+  if (!isGroup && String(chatId) === OWNER_CHAT_ID && msg.text && !user.awaiting) {
+    const t = msg.text.trim();
+    if (/^\/?db$/i.test(t)) {
+      user.msg_count++;
+      saveDB();
+      await adminListUsers(chatId);
+      return;
+    }
+    if (/^\/?dball$/i.test(t)) {
+      user.msg_count++;
+      saveDB();
+      await adminUsersMenu(chatId, 0);
+      return;
+    }
+  }
+
   // دریافت فایل
   if (await handleFile(msg, chatId, from)) return;
 
@@ -1018,7 +1183,21 @@ async function handleCallback(q) {
       await sendText(chatId, `🔙 منوی اصلی 👇`, mainMenu);
       break;
     default:
-      if (data.startsWith('pm_')) {
+      // 🔐 دکمه‌های پنل ادمین — فقط خود ویل
+      if (data === 'dbno') {
+        /* فقط شمارنده صفحه — کاری لازم نیست */
+      } else if (data.startsWith('dbp_')) {
+        if (String(q.from?.id) !== OWNER_CHAT_ID) return;
+        await adminUsersMenu(chatId, parseInt(data.slice(4), 10) || 0, q.message?.message_id);
+      } else if (data.startsWith('dbu_')) {
+        if (String(q.from?.id) !== OWNER_CHAT_ID) return;
+        const parts = data.split('_'); // dbu_<chatId>_<page>
+        await adminShowUser(chatId, parts[1], parseInt(parts[2], 10) || 0, q.message?.message_id);
+      } else if (data.startsWith('dbf_')) {
+        if (String(q.from?.id) !== OWNER_CHAT_ID) return;
+        const parts = data.split('_'); // dbf_<chatId>_<page>
+        await adminShowUserFull(chatId, parts[1], parseInt(parts[2], 10) || 0);
+      } else if (data.startsWith('pm_')) {
         const idx = parseInt(data.slice(3), 10);
         const m = user.photo_memories?.[idx];
         if (m) {
