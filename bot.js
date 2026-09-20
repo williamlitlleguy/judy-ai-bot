@@ -37,7 +37,7 @@ const REQUESTS_FILE = path.join(DATA_DIR, 'update-requests.json'); // صف در�
 const WELCOME_IMG = path.join(process.cwd(), 'assets', 'welcome.png');
 const MAX_HISTORY = 20; // حداکثر پیام‌هایی که حافظه نگه می‌دارد
 const VISION_MODEL = 'glm-4.5v'; // مدل بینایی ماشین برای دیدن عکس‌ها
-const BOT_VERSION = '2.3.1';
+const BOT_VERSION = '2.4.1';
 const OWNER_CHAT_ID = process.env.BOT_OWNER_ID || '5807801912'; // فقط ویل!
 const IMG_MODELS = ['glm-image', 'cogview-4', null]; // زنجیره مدل‌های تصویرساز: قوی‌تر ← جایگزین
 const GROUP_RANDOM_CHANCE = 0.08; // شانس پاسخ خودسرانه جودی در گروه‌ها (زنده بودن!)
@@ -85,6 +85,88 @@ function saveDB() {
     fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), 'utf8');
   } catch (e) {
     console.error('⚠️ خطا در ذخیره دیتابیس:', e.message);
+  }
+  scheduleCloudSave(); // ☁️ همگام‌سازی ابری
+}
+
+// ══════════════════════════ ☁️ دیتابیس ابری (گیت‌هاب خصوصی) ══════════════════════════
+// دیسک Render با هر دیپلوی/ری‌استارت پاک می‌شود؛ حافظه جودی در یک ریپوی «خصوصی»
+// گیت‌هاب ذخیره/بازیابی می‌شود (Secrets: DB_GITHUB_TOKEN و DB_GITHUB_REPO)
+
+const DB_GH_TOKEN = process.env.DB_GITHUB_TOKEN || '';
+const DB_GH_REPO = process.env.DB_GITHUB_REPO || 'williamlitlleguy/judy-ai-bot-db';
+const DB_GH_PATH = 'db.json';
+const DB_GH_API = 'https://api.github.com';
+let dbGhSha = null;
+let dbGhTimer = null;
+let dbGhDirty = false;
+
+function ghHeaders(extra = {}) {
+  return {
+    Authorization: `token ${DB_GH_TOKEN}`,
+    Accept: 'application/vnd.github+json',
+    'User-Agent': 'judy-bot',
+    ...extra,
+  };
+}
+
+/** بارگذاری حافظه از گیت‌هاب هنگام بوت (ادغام با کپی لوکال) */
+async function dbCloudLoad() {
+  if (!DB_GH_TOKEN) return;
+  try {
+    const res = await fetch(`${DB_GH_API}/repos/${DB_GH_REPO}/contents/${DB_GH_PATH}?ref=main`, { headers: ghHeaders() });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const meta = await res.json();
+    dbGhSha = meta.sha;
+    const remote = JSON.parse(Buffer.from(meta.content, 'base64').toString('utf8'));
+    if (remote && remote.users) {
+      const remoteN = Object.keys(remote.users).length;
+      const localN = Object.keys(db.users).length;
+      // یوزرهای لوکال که در ابر نیستند را اضافه کن
+      for (const [k, v] of Object.entries(db.users)) {
+        if (!remote.users[k]) remote.users[k] = v;
+      }
+      if ((db.offset || 0) > (remote.offset || 0)) remote.offset = db.offset;
+      db = remote;
+      console.log(`☁️ دیتابیس از گیت‌هاب بارگذاری شد — ابر: ${remoteN} | لوکال: ${localN} | نهایی: ${Object.keys(db.users).length} کاربر`);
+    }
+  } catch (e) {
+    if (String(e).includes('404')) console.log('☁️ دیتابیس ابری هنوز خالی است — با کپی لوکال شروع می‌شود');
+    else console.error('⚠️ خواندن دیتابیس ابری ناموفق (ادامه با کپی لوکال):', e.message);
+  }
+}
+
+/** ذخیره ابری با تأخیر (حداکثر هر ۶۰ ثانیه یک‌بار) */
+function scheduleCloudSave() {
+  if (!DB_GH_TOKEN) return;
+  dbGhDirty = true;
+  if (dbGhTimer) return;
+  dbGhTimer = setTimeout(flushCloud, 60_000);
+}
+
+async function flushCloud() {
+  dbGhTimer = null;
+  if (!DB_GH_TOKEN || !dbGhDirty) return;
+  dbGhDirty = false;
+  try {
+    const body = {
+      message: 'judy db sync',
+      content: Buffer.from(JSON.stringify(db, null, 2), 'utf8').toString('base64'),
+      branch: 'main',
+    };
+    if (dbGhSha) body.sha = dbGhSha;
+    const res = await fetch(`${DB_GH_API}/repos/${DB_GH_REPO}/contents/${DB_GH_PATH}`, {
+      method: 'PUT',
+      headers: ghHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const meta = await res.json();
+    dbGhSha = meta.content?.sha || dbGhSha;
+    console.log('☁️ حافظه جودی در گیت‌هاب ذخیره شد');
+  } catch (e) {
+    console.error('⚠️ ذخیره ابری ناموفق:', e.message);
+    dbGhDirty = true; // دفعه بعد دوباره تلاش می‌شود
   }
 }
 
@@ -239,13 +321,18 @@ async function askJudy(user, text, chatId = null, speaker = null) {
 
   let lastErr = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
+    if (Date.now() < primaryDownUntil) break; // گیت‌وای پایین است — مستقیم جایگزین
     try {
-      const completion = await zai.chat.completions.create({
-        messages: msgs,
-        thinking: { type: 'disabled' },
-      });
+      const completion = await Promise.race([
+        zai.chat.completions.create({
+          messages: msgs,
+          thinking: { type: 'disabled' },
+        }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('گیت‌وای اصلی: تایم‌اوت ۸ ثانیه‌ای')), 8000)),
+      ]);
       const reply = cleanAI(completion.choices?.[0]?.message?.content);
       if (!reply) throw new Error('پاسخ خالی از هوش مصنوعی');
+      primaryDownUntil = 0; // گیت‌وای سالم است
 
       user.history.push({ role: 'user', content: text });
       user.history.push({ role: 'assistant', content: reply });
@@ -254,9 +341,8 @@ async function askJudy(user, text, chatId = null, speaker = null) {
     } catch (e) {
       lastErr = e;
       console.error(`⚠️ تلاش ${attempt} برای پاسخ هوش مصنوعی ناموفق بود:`, e.message);
-      // اگر خطا اتصال شبکه باشد (هاست خارجی)، تلاش‌های بعدی بی‌فایده‌اند — مستقیم برو سراغ مغز جایگزین
-      const netErr = String(e?.message || e) + ' ' + String(e?.cause?.code || '');
-      if (/fetch failed|ConnectTimeout|ENOTFOUND|ECONNREFUSED|UND_ERR/i.test(netErr)) break;
+      // خطای شبکه/تایم‌اوت → ۳۰ دقیقه از مغز جایگزین استفاده کن و همین حالا برو سراغش
+      if (markPrimaryDown(e)) break;
       if (attempt < 3) await sleep(1000 * attempt);
     }
   }
@@ -281,6 +367,18 @@ async function askJudy(user, text, chatId = null, speaker = null) {
 
 const POLL_TEXT_URL = 'https://text.pollinations.ai/openai';
 const POLL_MODELS = ['openai', 'mistral'];
+
+/** تشخیص قطعی گیت‌وای اصلی — ۳۰ دقیقه از جایگزین استفاده می‌شود */
+let primaryDownUntil = 0;
+function markPrimaryDown(err) {
+  const msg = String(err?.message || err) + ' ' + String(err?.cause?.code || '') + ' ' + String(err?.cause?.message || '');
+  if (/fetch failed|ConnectTimeout|ENOTFOUND|ECONNREFUSED|UND_ERR|timeout|timed?\s?out/i.test(msg)) {
+    if (Date.now() >= primaryDownUntil) console.log('🌐 گیت‌وای اصلی در دسترس نیست — ۳۰ دقیقه مغز جایگزین جواب می‌دهد');
+    primaryDownUntil = Date.now() + 30 * 60 * 1000;
+    return true;
+  }
+  return false;
+}
 
 async function askPollinations(sys, history, text) {
   const msgs = [{ role: 'system', content: sys }, ...history, { role: 'user', content: text }];
@@ -606,6 +704,7 @@ function statsText(user, chatId) {
 
 /** پرامپت‌نویسی حرفه‌ای: توضیح فارسی کاربر ← پرامپت انگلیسی غنی (برای مدل قوی‌تر) */
 async function enrichPrompt(prompt) {
+  if (Date.now() < primaryDownUntil) return prompt; // گیت‌وای پایین — پرامپت خام
   try {
     const completion = await zai.chat.completions.create({
       messages: [
@@ -644,56 +743,87 @@ async function generateImageBuffer(prompt, models = IMG_MODELS) {
   throw lastErr || new Error('هیچ مدلی جواب نداد');
 }
 
-async function generateAndSendImage(chatId, user, prompt) {
-  await sendText(chatId, `🎨 <b>دارم عکست را می‌سازم...</b>\n\n📝 ${esc(prompt)}\n\nبا مدل قوی‌تر و پرامپت حرفه‌ای! کمی صبر کن ⏳`);
-  let enhanced = prompt;
+/** 🌐 ترجمه پرامپت فارسی به انگلیسی با مغز جایگزین (برای کیفیت بهتر تصویر Flux) */
+async function translatePromptEn(prompt) {
+  if (/^[\x00-\x7F\s\d]*$/.test(prompt)) return prompt; // قبلاً انگلیسی است
   try {
-    await tg('sendChatAction', { chat_id: chatId, action: 'upload_photo' }).catch(() => {});
-    // ۱) پرامپت حرفه‌ای: توضیح فارسی ← پرامپت انگلیسی غنی
-    enhanced = await enrichPrompt(prompt);
-    // ۲) زنجیره مدل‌های قوی
-    let result;
-    try {
-      result = await generateImageBuffer(enhanced);
-    } catch (e1) {
-      // ۳) اگر فیلتر رد کرد، آخرین تلاش با متن خام کاربر
-      if (isContentFilterError(e1) && enhanced !== prompt) {
-        result = await generateImageBuffer(prompt, [IMG_MODELS[0]]);
-      } else {
-        throw e1;
-      }
-    }
-    await tgUpload('sendPhoto', {
-      chat_id: chatId,
-      photo: result.buf,
-      __filename: 'judy-art.png',
-      caption: `🎨 <b>ساخته شد!</b> (مدل ${result.model})\n\n📝 ${esc(prompt)}`,
-      reply_markup: JSON.stringify(imgMenu),
+    const res = await fetch(POLL_TEXT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'openai',
+        messages: [
+          { role: 'system', content: 'Translate the user image description into ONE vivid English image prompt. Output ONLY the prompt text, max 60 words, safe-for-work, no quotes.' },
+          { role: 'user', content: prompt },
+        ],
+      }),
     });
-    user.img_count = (user.img_count || 0) + 1;
-    saveDB();
-    console.log(`🖼 عکس با مدل ${result.model} برای ${user.first_name} ساخته شد`);
-  } catch (e) {
-    console.error('❌ خطا در ساخت عکس:', String(e?.message || e));
-    // 🌐 تلاش با تصویرساز جایگزین رایگان (Pollinations / Flux)
+    if (res.ok) {
+      const data = await res.json();
+      const out = cleanAI(data?.choices?.[0]?.message?.content);
+      if (out) return out;
+    }
+  } catch { /* پرامپت خام بماند */ }
+  return prompt;
+}
+
+async function generateAndSendImage(chatId, user, prompt) {
+  await sendText(chatId, `🎨 <b>دارم عکست را می‌سازم...</b>\n\n📝 ${esc(prompt)}\n\nکمی صبر کن ⏳`);
+  let enhanced = prompt;
+  let filterErr = false;
+  // ۱) مسیر اصلی (گیت‌وای + مدل‌های GLM) — فقط اگر زنده باشد
+  if (Date.now() >= primaryDownUntil) {
     try {
-      console.log('🌐 تلاش با تصویرساز جایگزین (Pollinations)...');
       await tg('sendChatAction', { chat_id: chatId, action: 'upload_photo' }).catch(() => {});
-      const buf = await pollinationsImageBuffer(enhanced || prompt);
+      // پرامپت حرفه‌ای: توضیح فارسی ← پرامپت انگلیسی غنی
+      enhanced = await enrichPrompt(prompt);
+      // زنجیره مدل‌های قوی
+      let result;
+      try {
+        result = await generateImageBuffer(enhanced);
+      } catch (e1) {
+        // اگر فیلتر رد کرد، آخرین تلاش با متن خام کاربر
+        if (isContentFilterError(e1) && enhanced !== prompt) {
+          result = await generateImageBuffer(prompt, [IMG_MODELS[0]]);
+        } else {
+          throw e1;
+        }
+      }
       await tgUpload('sendPhoto', {
         chat_id: chatId,
-        photo: buf,
-        __filename: 'judy-art.jpg',
-        caption: `🎨 <b>ساخته شد!</b> (مدل جایگزین Flux)\n\n📝 ${esc(prompt)}`,
+        photo: result.buf,
+        __filename: 'judy-art.png',
+        caption: `🎨 <b>ساخته شد!</b> (مدل ${result.model})\n\n📝 ${esc(prompt)}`,
         reply_markup: JSON.stringify(imgMenu),
       });
       user.img_count = (user.img_count || 0) + 1;
       saveDB();
+      console.log(`🖼 عکس با مدل ${result.model} برای ${user.first_name} ساخته شد`);
       return;
-    } catch (e2) {
-      console.error('⚠️ تصویرساز جایگزین هم ناموفق:', e2.message);
+    } catch (e) {
+      console.error('❌ خطا در ساخت عکس (اصلی):', String(e?.message || e));
+      markPrimaryDown(e);
+      filterErr = isContentFilterError(e);
     }
-    if (isContentFilterError(e)) {
+  }
+  // ۲) 🌐 تصویرساز جایگزین رایگان (Pollinations / Flux)
+  try {
+    console.log('🌐 ساخت عکس با تصویرساز جایگزین (Pollinations)...');
+    await tg('sendChatAction', { chat_id: chatId, action: 'upload_photo' }).catch(() => {});
+    const finalPrompt = await translatePromptEn(enhanced || prompt);
+    const buf = await pollinationsImageBuffer(finalPrompt);
+    await tgUpload('sendPhoto', {
+      chat_id: chatId,
+      photo: buf,
+      __filename: 'judy-art.jpg',
+      caption: `🎨 <b>ساخته شد!</b> (مدل جایگزین Flux)\n\n📝 ${esc(prompt)}`,
+      reply_markup: JSON.stringify(imgMenu),
+    });
+    user.img_count = (user.img_count || 0) + 1;
+    saveDB();
+  } catch (e2) {
+    console.error('⚠️ تصویرساز جایگزین هم ناموفق:', e2.message);
+    if (filterErr) {
       await sendText(
         chatId,
         `🚫 <b>فیلتر ایمنی تصویرساز این توضیح را رد کرد!</b>\n\n` +
@@ -711,9 +841,46 @@ async function generateAndSendImage(chatId, user, prompt) {
   }
 }
 
+/** 👀 دیدن عکس با مغز جایگزین رایگان (وقتی گیت‌وای اصلی پایین است) */
+async function seePhotoFallback(chatId, user, dataUri) {
+  try {
+    const res = await fetch(POLL_TEXT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'openai',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'این عکس را کاربر در تلگرام برای تو (جودی، یک دستیار دوستانه) فرستاده. اول در یک جمله کوتاه توصیفش کن، بعد یک واکنش دوستانه و جالب درباره‌اش بگو. فارسی صمیمی، حداکثر ۳ جمله.' },
+            { type: 'image_url', image_url: { url: dataUri } },
+          ],
+        }],
+      }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const desc = cleanAI(data?.choices?.[0]?.message?.content);
+      if (desc) {
+        user.history.push({ role: 'user', content: '[کاربر یک عکس فرستاد]' });
+        user.history.push({ role: 'assistant', content: desc });
+        if (user.history.length > MAX_HISTORY) user.history = user.history.slice(-MAX_HISTORY);
+        await sendText(chatId, `👀 <b>دیدمش!</b>\n\n${fmt(desc)}`);
+        return desc;
+      }
+    }
+  } catch (e2) {
+    console.error('⚠️ دیدن عکس جایگزین هم ناموفق:', e2.message);
+  }
+  return null;
+}
+
 /** دیدن عکس با مدل بینایی + ثبت در حافظه */
 async function seePhoto(chatId, user, photoBuffer) {
   const dataUri = `data:image/jpeg;base64,${photoBuffer.toString('base64')}`;
+  if (Date.now() >= primaryDownUntil) {
+    return seePhotoFallback(chatId, user, dataUri); // گیت‌وای پایین — مستقیم جایگزین
+  }
   try {
     await tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
     const res = await zai.chat.completions.createVision({
@@ -737,37 +904,8 @@ async function seePhoto(chatId, user, photoBuffer) {
     return desc;
   } catch (e) {
     console.error('⚠️ خطا در دیدن عکس (اصلی):', e.message);
-    // 🌐 دیدن عکس با مغز جایگزین رایگان
-    try {
-      const res = await fetch(POLL_TEXT_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'openai',
-          messages: [{
-            role: 'user',
-            content: [
-              { type: 'text', text: 'این عکس را کاربر در تلگرام برای تو (جودی، یک دستیار دوستانه) فرستاده. اول در یک جمله کوتاه توصیفش کن، بعد یک واکنش دوستانه و جالب درباره‌اش بگو. فارسی صمیمی، حداکثر ۳ جمله.' },
-              { type: 'image_url', image_url: { url: dataUri } },
-            ],
-          }],
-        }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const desc = cleanAI(data?.choices?.[0]?.message?.content);
-        if (desc) {
-          user.history.push({ role: 'user', content: '[کاربر یک عکس فرستاد]' });
-          user.history.push({ role: 'assistant', content: desc });
-          if (user.history.length > MAX_HISTORY) user.history = user.history.slice(-MAX_HISTORY);
-          await sendText(chatId, `👀 <b>دیدمش!</b>\n\n${fmt(desc)}`);
-          return desc;
-        }
-      }
-    } catch (e2) {
-      console.error('⚠️ دیدن عکس جایگزین هم ناموفق:', e2.message);
-    }
-    return null;
+    markPrimaryDown(e);
+    return seePhotoFallback(chatId, user, dataUri);
   }
 }
 
@@ -1365,6 +1503,7 @@ async function main() {
     } catch (e) { console.error('⚠️ ساخت کانفیگ AI ناموفق:', e.message); }
   }
   loadDB();
+  await dbCloudLoad(); // ☁️ بازیابی حافظه از گیت‌هاب (برای هاست‌هایی که دیسکشان پاک می‌شود)
   zai = await ZAI.create();
   const me = await tg('getMe');
   BOT_USERNAME = me.username;
@@ -1385,13 +1524,33 @@ function startKeepaliveServer() {
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end(`🤖 Judy bot v${BOT_VERSION} is alive!`);
     }).listen(Number(PORT), () => console.log(`🌐 وب‌سرور Keepalive روی پورت ${PORT} روشن شد`));
+    startSelfPing();
   } catch (e) {
     console.error('⚠️ وب‌سرور Keepalive روشن نشد:', e.message);
   }
 }
 
+/** 🔄 Self-ping — هر ۵ دقیقه خودش را صدا می‌زند تا Render رایگان نخوابد */
+function startSelfPing() {
+  const url = process.env.RENDER_EXTERNAL_URL;
+  if (!url) return; // فقط روی Render
+  setInterval(() => {
+    fetch(url).then((r) => console.log(`🔄 self-ping: ${r.status}`)).catch(() => {});
+  }, 5 * 60 * 1000).unref?.();
+  console.log('🔄 Self-ping هر ۵ دقیقه روشن شد تا سرویس بیدار بماند');
+}
+
 process.on('unhandledRejection', (e) => console.error('⚠️ unhandledRejection:', e?.message));
 process.on('uncaughtException', (e) => console.error('⚠️ uncaughtException:', e?.message));
+
+/** 🚪 خاموشی تمیز — آخرین حافظه را قبل از رفتن در ابر ذخیره کن */
+async function gracefulShutdown() {
+  console.log('🚪 خاموشی — ذخیره نهایی حافظه در ابر...');
+  try { await flushCloud(); } catch { /* تلاش نهایی انجام شد */ }
+  process.exit(0);
+}
+process.on('SIGTERM', gracefulShutdown); // Render موقع خواب/دیپلوی SIGTERM می‌فرستد
+process.on('SIGINT', gracefulShutdown);
 
 main().catch((e) => {
   console.error('❌ بات متوقف شد:', e);
