@@ -1,6 +1,6 @@
 {
   "name": "judy-telegram-bot",
-  "version": "2.2.0",
+  "version": "2.4.1",
   "description": "بات جودی — دستیار هوش مصنوعی تلگرام با حافظه، حافظه تصویری، پشتیبانی گروه و منوی شیشه‌ای",
   "type": "module",
   "main": "bot.js",
