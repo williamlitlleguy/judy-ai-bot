@@ -37,7 +37,7 @@ const REQUESTS_FILE = path.join(DATA_DIR, 'update-requests.json'); // صف در�
 const WELCOME_IMG = path.join(process.cwd(), 'assets', 'welcome.png');
 const MAX_HISTORY = 20; // حداکثر پیام‌هایی که حافظه نگه می‌دارد
 const VISION_MODEL = 'glm-4.5v'; // مدل بینایی ماشین برای دیدن عکس‌ها
-const BOT_VERSION = '2.6.4'; // 🧠 GLM با failover دوسروره + پرش سریع از گیت‌وای مرده
+const BOT_VERSION = '2.6.5'; // 🧠 GLM دوسروره + خنک‌سازی خرابی — پیام‌ها هیچ‌وقت گیر نمی‌کنند
 const BOOT_TS = Date.now(); // برای تفکیک همپوشانی دیپلوی از نفوذی واقعی
 // 🔒 حالت دروازه (webhook) — تنها کسی که پیام‌ها را می‌بیند خودِ تلگرام است
 //     🚪 v2.6.2: مالک فرمان داد دسترسی باز شود (بازی تمام شد) — false یعنی همه‌چیز مثل قبل polling
@@ -590,6 +590,7 @@ const GLM_ENDPOINTS = [
   'https://api.z.ai/api/paas/v4/chat/completions',         // پشتیبان بین‌المللی
 ];
 const ON_RENDER = !!process.env.RENDER_EXTERNAL_URL; // روی Render گیت‌وای داخلی هرگز وصل نمی‌شود
+let glmDownUntil = 0; // اگر GLM سراسری خراب شد — ۵ دقیقه خنک‌سازی تا پیام‌ها سریع به مغز بعدی برسند
 
 /** fetch با تایم‌اوت — هیچ مغزی نباید بات را معلق کند */
 async function fetchT(url, opts = {}, ms = 30000) {
@@ -640,24 +641,31 @@ async function glmRequest(payload, ms = 15000) {
   throw lastErr || new Error('هیچ سرور GLM در دسترس نیست');
 }
 
-/** 🧠 مغز GLM — رایگان (GLM-4.7-Flash) با failover دوسروره */
+/** 🧠 مغز GLM — رایگان (GLM-4.7-Flash) با failover دوسروره + خنک‌سازی خرابی */
 async function askGLM(sys, history, text) {
   if (!GLM_KEY) throw new Error('کلید GLM تنظیم نشده');
-  const data = await glmRequest({
-    model: GLM_MODEL,
-    messages: [
-      { role: 'system', content: sys },
-      ...history.filter(m => m.role === 'user' || m.role === 'assistant'),
-      { role: 'user', content: text },
-    ],
-    temperature: 0.85,
-    max_tokens: 2048,
-    thinking: { type: 'disabled' }, // جودی چت‌بات است نه فیلسوف — سرعت مهم‌تر است
-  });
-  const reply = cleanAI(data?.choices?.[0]?.message?.content || '');
-  if (!reply) throw new Error('GLM پاسخ خالی');
-  console.log('🧠 پاسخ با مغز GLM داده شد');
-  return reply;
+  if (Date.now() < glmDownUntil) throw new Error('GLM خنک‌سازی موقت — رد شدن سریع');
+  try {
+    const data = await glmRequest({
+      model: GLM_MODEL,
+      messages: [
+        { role: 'system', content: sys },
+        ...history.filter(m => m.role === 'user' || m.role === 'assistant'),
+        { role: 'user', content: text },
+      ],
+      temperature: 0.85,
+      max_tokens: 2048,
+      thinking: { type: 'disabled' }, // جودی چت‌بات است نه فیلسوف — سرعت مهم‌تر است
+    });
+    const reply = cleanAI(data?.choices?.[0]?.message?.content || '');
+    if (!reply) throw new Error('GLM پاسخ خالی');
+    glmDownUntil = 0; // سالم است — خنک‌سازی برداشته شود
+    console.log('🧠 پاسخ با مغز GLM داده شد');
+    return reply;
+  } catch (e) {
+    glmDownUntil = Date.now() + 5 * 60 * 1000; // ۵ دقیقه از GLM عبور کن تا کاربر معطل نشود
+    throw e;
+  }
 }
 
 /** 🧠 مغز Gemini — چت فارسی باکیفیت + رایگان با کلید Google AI Studio */
