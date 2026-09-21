@@ -37,7 +37,7 @@ const REQUESTS_FILE = path.join(DATA_DIR, 'update-requests.json'); // صف در�
 const WELCOME_IMG = path.join(process.cwd(), 'assets', 'welcome.png');
 const MAX_HISTORY = 20; // حداکثر پیام‌هایی که حافظه نگه می‌دارد
 const VISION_MODEL = 'glm-4.5v'; // مدل بینایی ماشین برای دیدن عکس‌ها
-const BOT_VERSION = '2.4.2';
+const BOT_VERSION = '2.4.3';
 const OWNER_CHAT_ID = process.env.BOT_OWNER_ID || '5807801912'; // فقط ویل!
 const IMG_MODELS = ['glm-image', 'cogview-4', null]; // زنجیره مدل‌های تصویرساز: قوی‌تر ← جایگزین
 const GROUP_RANDOM_CHANCE = 0.08; // شانس پاسخ خودسرانه جودی در گروه‌ها (زنده بودن!)
@@ -114,7 +114,7 @@ function ghHeaders(extra = {}) {
 async function dbCloudLoad() {
   if (!DB_GH_TOKEN) return;
   try {
-    const res = await fetch(`${DB_GH_API}/repos/${DB_GH_REPO}/contents/${DB_GH_PATH}?ref=main`, { headers: ghHeaders() });
+    const res = await fetchT(`${DB_GH_API}/repos/${DB_GH_REPO}/contents/${DB_GH_PATH}?ref=main`, { headers: ghHeaders() }, 30000);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const meta = await res.json();
     dbGhSha = meta.sha;
@@ -155,11 +155,11 @@ async function flushCloud() {
       branch: 'main',
     };
     if (dbGhSha) body.sha = dbGhSha;
-    const res = await fetch(`${DB_GH_API}/repos/${DB_GH_REPO}/contents/${DB_GH_PATH}`, {
+    const res = await fetchT(`${DB_GH_API}/repos/${DB_GH_REPO}/contents/${DB_GH_PATH}`, {
       method: 'PUT',
       headers: ghHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(body),
-    });
+    }, 60000);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const meta = await res.json();
     dbGhSha = meta.content?.sha || dbGhSha;
@@ -195,11 +195,11 @@ function getUser(chatId, from, chat = null) {
 // ══════════════════════════ توابع تلگرام ══════════════════════════
 
 async function tg(method, payload = {}) {
-  const res = await fetch(`${API}/${method}`, {
+  const res = await fetchT(`${API}/${method}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
-  });
+  }, 45000); // getUpdates تا ۳۰ ثانیه long-poll می‌شود — ۴۵ ثانیه سقف امن
   const json = await res.json();
   if (!json.ok) throw new Error(`${method}: ${json.description}`);
   return json.result;
@@ -213,7 +213,7 @@ async function tgUpload(method, fields) {
     if (Buffer.isBuffer(val)) form.append(key, new Blob([val]), fields.__filename || 'file.png');
     else form.append(key, String(val));
   }
-  const res = await fetch(`${API}/${method}`, { method: 'POST', body: form });
+  const res = await fetchT(`${API}/${method}`, { method: 'POST', body: form }, 150000); // آپلود فایل می‌تواند کند باشد
   const json = await res.json();
   if (!json.ok) throw new Error(`${method}: ${json.description}`);
   return json.result;
@@ -221,7 +221,7 @@ async function tgUpload(method, fields) {
 
 async function downloadTelegramFile(filePath) {
   const url = `https://api.telegram.org/file/bot${TOKEN}/${filePath}`;
-  const res = await fetch(url);
+  const res = await fetchT(url, {}, 60000);
   if (!res.ok) throw new Error(`دانلود فایل ناموفق بود: ${res.status}`);
   return Buffer.from(await res.arrayBuffer());
 }
@@ -1610,6 +1610,15 @@ async function handleUpdate(update) {
 
 async function poll() {
   console.log('🔄 در حال گوش دادن به پیام‌ها...');
+  let lastPollOk = Date.now();
+  // 🚨 Watchdog — اگر polling بیشتر از ۲ دقیقه یخ بزند، پروسه را می‌کشد تا Render دوباره بالا بیاورد
+  const watchdog = setInterval(() => {
+    if (Date.now() - lastPollOk > 120_000) {
+      console.error('🚨 Watchdog: polling بیشتر از ۲ دقیقه پاسخ نداد — ری‌استارت اضطراری پروسه');
+      clearInterval(watchdog);
+      process.exit(1); // Render خودکار دوباره بالا می‌آورد
+    }
+  }, 30_000);
   while (true) {
     try {
       const updates = await tg('getUpdates', {
@@ -1617,9 +1626,11 @@ async function poll() {
         timeout: 30,
         allowed_updates: ['message', 'callback_query', 'my_chat_member'],
       });
+      lastPollOk = Date.now();
       for (const u of updates) {
         db.offset = u.update_id + 1;
         await handleUpdate(u); // ترتیب پیام‌ها حفظ می‌شود
+        lastPollOk = Date.now();
         saveDB();
       }
     } catch (e) {
@@ -1628,6 +1639,13 @@ async function poll() {
     }
   }
 }
+
+// 🛡️ گاردهای سطح پروسه — خطای پیش‌بینی‌نشده هرگز بات را زامبی نمی‌کند
+process.on('unhandledRejection', (r) => console.error('🚨 unhandledRejection:', r));
+process.on('uncaughtException', (e) => {
+  console.error('🚨 uncaughtException:', e);
+  process.exit(1); // Render خودکار دوباره بالا می‌آورد
+});
 
 async function main() {
   // 🔑 اگر کلید هوش مصنوعی به‌صورت Secret محیطی باشد (HF/Render)، خودم فایل کانفیگ را می‌سازم
