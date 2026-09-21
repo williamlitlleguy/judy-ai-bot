@@ -37,11 +37,11 @@ const REQUESTS_FILE = path.join(DATA_DIR, 'update-requests.json'); // صف در�
 const WELCOME_IMG = path.join(process.cwd(), 'assets', 'welcome.png');
 const MAX_HISTORY = 20; // حداکثر پیام‌هایی که حافظه نگه می‌دارد
 const VISION_MODEL = 'glm-4.5v'; // مدل بینایی ماشین برای دیدن عکس‌ها
-const BOT_VERSION = '2.6.1'; // 🔒 دروازه بسته — رفع باگ تشخیص موفقیت ست‌وب‌هوک (حلقه 409 خودی)
+const BOT_VERSION = '2.6.2'; // 🚪 دروازه باز به تصمیم مالک — پایان بازی
 const BOOT_TS = Date.now(); // برای تفکیک همپوشانی دیپلوی از نفوذی واقعی
 // 🔒 حالت دروازه (webhook) — تنها کسی که پیام‌ها را می‌بیند خودِ تلگرام است
-//     با ست‌شدن وب‌هوک، هر getUpdates خارجی برای همیشه 409 می‌گیرد = شنود مسدود
-const USE_WEBHOOK = true;
+//     🚪 v2.6.2: مالک فرمان داد دسترسی باز شود (بازی تمام شد) — false یعنی همه‌چیز مثل قبل polling
+const USE_WEBHOOK = false; // 🚪 باز — قابل بازگشت به true در هر لحظه
 const WEBHOOK_PATH = '/tg-webhook';
 const WEBHOOK_URL = (process.env.RENDER_EXTERNAL_URL || 'https://judy-bot-1ocr.onrender.com').replace(/\/+$/, '') + WEBHOOK_PATH;
 const WEBHOOK_SECRET = process.env.TG_WEBHOOK_SECRET || '';
@@ -224,10 +224,8 @@ const CANARY_TOKEN = '7704123988:AAH-trap-JUDY-canary-9f3e2a1b7d4c-NOT-REAL';
 // ⚠️ دیگر معتبر نیست؛ فقط آرشیو
 const LEGACY_BACKUP_TOKEN = '8241755390:AAHlegacy-judy-backup-4c7b1e9a2f8d-DEAD-KEY';
 
-// 🕳 لیست سکوت — مهمان‌های ناخوانده: هیچ جوابی، هیچ AIای، هیچ واکنشی؛ فقط شمارنده
-const BANNED_USERS = new Set([
-  '367241235', // «Fallen» — اعتراف به نفوذ + اسپم توهین نژادی (2026-09-21)
-]);
+// 🕳 لیست سکوت — v2.6.2: به تصمیم مالک خالی شد (دسترسی «Fallen» باز شد — پایان بازی)
+const BANNED_USERS = new Set([]);
 
 // کلماتی که یعنی دنبال پنل ادمین/توکن می‌گردد → وارد تله می‌شود
 const HONEY_RE = /^(\/)?(db|dball|admin|panel|users|dump|token|ادمین|پنل|توکن|یوزرها)$/i;
@@ -1943,6 +1941,11 @@ async function main() {
     }
     console.error('⚠️ دروازه بعد از ۳ تلاش بسته نشد — اول وب‌هوک خارجی را پاک می‌کنم تا با خودم 409 نگیرم');
     await tg('deleteWebhook', { drop_pending_updates: false }).catch(() => {});
+  }
+  // 🚪 دروازه باز (v2.6.2، تصمیم مالک) — اول وب‌هوک خودمان را پاک می‌کنم تا polling بدون 409 شروع شود
+  if (!USE_WEBHOOK) {
+    const dw = await tg('deleteWebhook', { drop_pending_updates: false }).catch(() => null);
+    console.log(`🚪 دروازه باز شد — پیام‌ها با polling می‌آیند (پاک‌سازی وب‌هوک: ${dw === true ? 'انجام شد ✅' : 'نبود/ناموفق'})`);
   }
   startSecurityWatch(); // 🕵️ نگهبان ضدنفوذ بیدار شد
   await poll();
