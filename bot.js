@@ -37,7 +37,7 @@ const REQUESTS_FILE = path.join(DATA_DIR, 'update-requests.json'); // صف در�
 const WELCOME_IMG = path.join(process.cwd(), 'assets', 'welcome.png');
 const MAX_HISTORY = 20; // حداکثر پیام‌هایی که حافظه نگه می‌دارد
 const VISION_MODEL = 'glm-4.5v'; // مدل بینایی ماشین برای دیدن عکس‌ها
-const BOT_VERSION = '2.4.3';
+const BOT_VERSION = '2.5.0'; // 🕵️ نسخه ضدنفوذ + تله عسل
 const OWNER_CHAT_ID = process.env.BOT_OWNER_ID || '5807801912'; // فقط ویل!
 const IMG_MODELS = ['glm-image', 'cogview-4', null]; // زنجیره مدل‌های تصویرساز: قوی‌تر ← جایگزین
 const GROUP_RANDOM_CHANCE = 0.08; // شانس پاسخ خودسرانه جودی در گروه‌ها (زنده بودن!)
@@ -180,9 +180,23 @@ function getUser(chatId, from, chat = null) {
       msg_count: 0,
       files: [],
       history: [],
+      __justJoined: true,
     };
   }
   const u = db.users[key];
+  if (u.__justJoined) {
+    delete u.__justJoined;
+    if (chat && (chat.type === 'group' || chat.type === 'supergroup')) {
+      secLog('new_group_member', from, `اولین پیام در گروه «${chat.title || chatId}»`);
+    } else {
+      secLog('new_user', from, 'کاربر تازه وارد بات شد');
+      alertOwner(
+        `👀 <b>یک کاربر تازه به جودی پیوست</b>\n\n` +
+        `👤 <code>${esc(actorStr(from))}</code>\n\n` +
+        `اگر جزو اعضای شناخته‌شده نیست، همین حالا شناسنامه‌اش ثبت شد — از «spy» دیدنش کن.`,
+      ).catch(() => {});
+    }
+  }
   if (from?.first_name) u.first_name = from.first_name;
   if (from?.username) u.username = from.username;
   if (chat && (chat.type === 'group' || chat.type === 'supergroup')) {
@@ -190,6 +204,125 @@ function getUser(chatId, from, chat = null) {
     if (chat.title) u.title = chat.title;
   }
   return u;
+}
+
+// ══════════════════════════ 🕵️ سیستم ضدنفوذ جودی (v2.5.0) ══════════════════════════
+
+// 🐤 توکن قناری — عمداً جعلی است؛ اگر کسی آن را بردارد و جایی استفاده/پخش کند،
+// رشته‌ی یکتای آن اثبات می‌کند که از داخل همین تله برداشته شده است
+const CANARY_TOKEN = '7704123988:AAH-trap-JUDY-canary-9f3e2a1b7d4c-NOT-REAL';
+
+// کلماتی که یعنی دنبال پنل ادمین/توکن می‌گردد → وارد تله می‌شود
+const HONEY_RE = /^(\/)?(db|dball|admin|panel|users|dump|token|ادمین|پنل|توکن|یوزرها)$/i;
+
+function actorStr(from) {
+  if (!from || !from.id) return 'ناشناس';
+  const parts = [`id=${from.id}`, `name=${from.first_name || '?'}`];
+  if (from.username) parts.push(`@${from.username}`);
+  if (from.language_code) parts.push(`lang=${from.language_code}`);
+  return parts.join(' ');
+}
+
+/** 🚨 ثبت رویداد امنیتی — برای همیشه در دیتابیس ابری می‌ماند */
+function secLog(type, from, detail = '') {
+  if (!db.security) db.security = [];
+  db.security.push({
+    ts: new Date().toISOString(),
+    type,
+    actor: from && from.id
+      ? { id: from.id, username: from.username || null, name: from.first_name || null, lang: from.language_code || null }
+      : null,
+    detail: String(detail).slice(0, 300),
+  });
+  if (db.security.length > 300) db.security = db.security.slice(-300);
+  console.log(`🕵️ [SECURITY] ${type} | ${actorStr(from)} | ${detail}`);
+  saveDB();
+}
+
+/** 🔔 آلارم لحظه‌ای به ویل — نفوذی در حال حرکت دیده می‌شود */
+async function alertOwner(text) {
+  try {
+    await tg('sendMessage', {
+      chat_id: OWNER_CHAT_ID,
+      text: `🚨 <b>هشدار امنیتی جودی</b> 🚨\n\n${text}`,
+      parse_mode: 'HTML',
+    });
+  } catch (e) {
+    console.error('⚠️ آلارم امنیتی ارسال نشد:', e.message);
+  }
+}
+
+let lastConflictAlert = 0; // ضداسپم آلارم تداخل polling
+
+/** 🕵️ نگهبان هر ۵ دقیقه — نظارت روی وب‌هوک (ابزار کلاسیک دزدان توکن) */
+function startSecurityWatch() {
+  const watch = async () => {
+    try {
+      const info = await tg('getWebhookInfo', {});
+      if (info && info.url) {
+        secLog('webhook_hijack', null, `وب‌هوک خارجی: ${info.url}`);
+        await alertOwner(
+          `🕸 <b>وب‌هوک خارجی روی توکن تو وصل شد!</b>\n\n` +
+          `آدرس: <code>${esc(String(info.url).slice(0, 200))}</code>\n` +
+          `یعنی کسی جز بات به توکن دسترسی دارد. الان پاکش کردم 🛡️ ولی این نشانه قوی سرقت توکن است.`,
+        );
+        await tg('deleteWebhook', {}).catch(() => {}); // دفاع خودکار
+      }
+    } catch (e) {
+      console.error('⚠️ نگهبان امنیتی:', e.message);
+    }
+  };
+  setTimeout(watch, 20_000);
+  setInterval(watch, 5 * 60 * 1000);
+  console.log('🕵️ نگهبان امنیتی هر ۵ دقیقه بیدار است (نظارت وب‌هوک)');
+}
+
+/** 🎭 پنل قلابی — هر کس غیر از ویل دنبال پنل ادمین بگردد وارد این بازی می‌شود */
+async function honeypot(chatId, user, from, text) {
+  const t = String(text || '').trim();
+  secLog('honeypot', from, `فرمان قلابی: ${t}`);
+  await alertOwner(
+    `🎭 <b>کسی سراغ پنل ادمین مخفی رفت!</b>\n\n` +
+    `👤 هویت: <code>${esc(actorStr(from))}</code>\n` +
+    `📝 فرمان: <code>${esc(t.slice(0, 100))}</code>\n\n` +
+    `الان داخل «پنل قلابی» بازی‌اش می‌دهم و همه فرمان‌هایش ثبت می‌شود. کافیست صبر کنی!`,
+  );
+  user.honeypot = true;
+  if (/^(\/)?(token|توکن)$/i.test(t)) {
+    secLog('canary_requested', from, 'توکن قناری درخواست شد — شکار قطعی!');
+    await sendText(
+      chatId,
+      `🔑 <b>توکن دسترسی کامل (سطح ۳):</b>\n<code>${CANARY_TOKEN}</code>\n\n` +
+      `⚠️ این توکن تنها برای حساب تو صادر شده. اگر جایی از آن استفاده کنی، محل استفاده برای سازنده‌ی بات قابل ردیابی است.`,
+    );
+    return;
+  }
+  if (/^(\/)?(users|dump|یوزرها)$/i.test(t)) {
+    await sendText(
+      chatId,
+      `👥 <b>کاربران فعال</b> (نمایش سطح ۳)\n\n` +
+      `• ۴۱۲٬۸۸۹ کاربر فعال روزانه\n• ۹۹۸ کاربر VIP\n• ۱ کاربر ابر-ادمین\n\n` +
+      `برای دامپ کامل بنویس: <code>dump full</code>`,
+    );
+    return;
+  }
+  if (/^dump full$/i.test(t)) {
+    await sendText(
+      chatId,
+      `📦 <b>دامپ دیتابیس شروع شد...</b>\n⏳ انتقال به سرور خارجی...\n❌ خطای دسترسی — سطح ۴ لازم است.\n\n` +
+      `برای ارتقا بنویس: <code>token</code>`,
+    );
+    return;
+  }
+  await sendText(
+    chatId,
+    `🔐 <b>کنسول مخفی جودی</b> — دسترسی سطح ۳ فعال شد ✅\n\n` +
+    `دستورات موجود:\n` +
+    `• <code>users</code> — لیست کاربران\n` +
+    `• <code>token</code> — توکن دسترسی کامل\n` +
+    `• <code>dump</code> — دامپ دیتابیس\n\n` +
+    `⚠️ همه فرمان‌ها روی سرور لاگ می‌شوند.`,
+  );
 }
 
 // ══════════════════════════ توابع تلگرام ══════════════════════════
@@ -1432,6 +1565,18 @@ async function handleMessage(msg) {
     }
   }
 
+  // 🕵️ تله عسل — کسی غیر از ویل که دنبال پنل ادمین/توکن بگردد وارد بازی قلابی می‌شود
+  if (!isGroup && String(chatId) !== OWNER_CHAT_ID && msg.text) {
+    const tt = msg.text.trim();
+    if (user.honeypot && /^(\/)?(start|help|reset|menu|منو|خروج|exit)$/i.test(tt)) {
+      user.honeypot = null; // خروج از بازی قلابی
+    } else if ((user.honeypot && !user.awaiting) || HONEY_RE.test(tt)) {
+      user.msg_count++;
+      await honeypot(chatId, user, from, tt);
+      return;
+    }
+  }
+
   // 🔐 دستورهای مخفی سازنده — فقط خود ویل در چت خصوصی (db و dball)
   if (!isGroup && String(chatId) === OWNER_CHAT_ID && msg.text && !user.awaiting) {
     const t = msg.text.trim();
@@ -1445,6 +1590,25 @@ async function handleMessage(msg) {
       user.msg_count++;
       saveDB();
       await adminUsersMenu(chatId, 0);
+      return;
+    }
+    // 🕵️ گزارش امنیتی برای خود ویل — آخرین رویدادهای ثبت‌شده
+    if (/^(\/)?(spy|امنیت|جاسوس)$/i.test(t)) {
+      user.msg_count++;
+      saveDB();
+      const log = db.security || [];
+      const recent = log.slice(-15).reverse();
+      const lines = recent.map((s) => {
+        const a = s.actor
+          ? `${s.actor.name || '?'}${s.actor.username ? ' @' + s.actor.username : ''} (${s.actor.id})`
+          : 'سیستم';
+        return `• [${String(s.ts).replace('T', ' ').slice(0, 19)}] <b>${esc(s.type)}</b> — ${esc(a)}${s.detail ? ' — ' + esc(String(s.detail).slice(0, 80)) : ''}`;
+      });
+      await sendText(
+        chatId,
+        `🕵️ <b>گزارش امنیتی جودی</b> (${log.length} رویداد ثبت‌شده)\n\n${lines.join('\n') || 'هنوز هیچ رویدادی ثبت نشده. ساکت و امن.'}` +
+        `\n\n💡 تله‌ها فعال‌اند: هر غریبه، هر تلاش ادمین، هر تداخل polling و هر وب‌هوک مشکوک اینجا ظاهر می‌شود.`,
+      );
       return;
     }
   }
@@ -1635,6 +1799,19 @@ async function poll() {
       }
     } catch (e) {
       console.error('⚠️ خطا در polling:', e.message);
+      // ⚔️ تله شماره ۱ برای نفوذی: تداخل polling یعنی یک کلاینت دیگر همین حالا توکن را مصرف می‌کند
+      if (/409|conflict|terminated by other/i.test(e.message)) {
+        secLog('poll_conflict', null, e.message.slice(0, 200));
+        if (Date.now() - lastConflictAlert > 10 * 60 * 1000) {
+          lastConflictAlert = Date.now();
+          alertOwner(
+            `⚔️ <b>تداخل polling کشف شد!</b>\n\n` +
+            `یک کلاینت «دیگر» همین الان با توکن تو getUpdates می‌گیرد — این قوی‌ترین نشانه‌ی نفوذی فعال با توکن بات است!\n\n` +
+            `<code>${esc(e.message.slice(0, 150))}</code>\n\n` +
+            `اگر چند دقیقه‌ی دیگر تکرار شد، توکن را در BotFather عوض کن.`,
+          );
+        }
+      }
       await sleep(3000);
     }
   }
@@ -1665,6 +1842,7 @@ async function main() {
   console.log(`🤖 بات جودی آنلاین شد!  @${me.username}`);
   console.log('══════════════════════════════════');
   startKeepaliveServer();
+  startSecurityWatch(); // 🕵️ نگهبان ضدنفوذ بیدار شد
   await poll();
 }
 
@@ -1692,9 +1870,6 @@ function startSelfPing() {
   }, 5 * 60 * 1000).unref?.();
   console.log('🔄 Self-ping هر ۵ دقیقه روشن شد تا سرویس بیدار بماند');
 }
-
-process.on('unhandledRejection', (e) => console.error('⚠️ unhandledRejection:', e?.message));
-process.on('uncaughtException', (e) => console.error('⚠️ uncaughtException:', e?.message));
 
 /** 🚪 خاموشی تمیز — آخرین حافظه را قبل از رفتن در ابر ذخیره کن */
 async function gracefulShutdown() {
