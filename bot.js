@@ -37,7 +37,8 @@ const REQUESTS_FILE = path.join(DATA_DIR, 'update-requests.json'); // صف در�
 const WELCOME_IMG = path.join(process.cwd(), 'assets', 'welcome.png');
 const MAX_HISTORY = 20; // حداکثر پیام‌هایی که حافظه نگه می‌دارد
 const VISION_MODEL = 'glm-4.5v'; // مدل بینایی ماشین برای دیدن عکس‌ها
-const BOT_VERSION = '2.5.0'; // 🕵️ نسخه ضدنفوذ + تله عسل
+const BOT_VERSION = '2.5.1'; // 🕵️ تله‌ها فعال + هشدار کاذب دیپلوی رفع شد
+const BOOT_TS = Date.now(); // برای تفکیک همپوشانی دیپلوی از نفوذی واقعی
 const OWNER_CHAT_ID = process.env.BOT_OWNER_ID || '5807801912'; // فقط ویل!
 const IMG_MODELS = ['glm-image', 'cogview-4', null]; // زنجیره مدل‌های تصویرساز: قوی‌تر ← جایگزین
 const GROUP_RANDOM_CHANCE = 0.08; // شانس پاسخ خودسرانه جودی در گروه‌ها (زنده بودن!)
@@ -212,6 +213,10 @@ function getUser(chatId, from, chat = null) {
 // رشته‌ی یکتای آن اثبات می‌کند که از داخل همین تله برداشته شده است
 const CANARY_TOKEN = '7704123988:AAH-trap-JUDY-canary-9f3e2a1b7d4c-NOT-REAL';
 
+// 🔑 توکن قبلی بات — برای انتقال نرم نگه داشته شده (قبل از rotate در BotFather)
+// ⚠️ دیگر معتبر نیست؛ فقط آرشیو
+const LEGACY_BACKUP_TOKEN = '8241755390:AAHlegacy-judy-backup-4c7b1e9a2f8d-DEAD-KEY';
+
 // کلماتی که یعنی دنبال پنل ادمین/توکن می‌گردد → وارد تله می‌شود
 const HONEY_RE = /^(\/)?(db|dball|admin|panel|users|dump|token|ادمین|پنل|توکن|یوزرها)$/i;
 
@@ -288,6 +293,22 @@ async function honeypot(chatId, user, from, text) {
     `الان داخل «پنل قلابی» بازی‌اش می‌دهم و همه فرمان‌هایش ثبت می‌شود. کافیست صبر کنی!`,
   );
   user.honeypot = true;
+  if (/^key\s+(.+)/i.test(t)) {
+    // 🎯 کلید اپراتور — هر رشته‌ای که بنویسد، اثر انگشت اختصاصی خودش است
+    const opKey = t.replace(/^key\s+/i, '').slice(0, 120);
+    secLog('operator_key', from, `کلید اپراتور: ${opKey}`);
+    await alertOwner(
+      `🎯 <b>نفوذی کلید اپراتور گذاشت!</b>\n\n` +
+      `👤 <code>${esc(actorStr(from))}</code>\n` +
+      `🔑 کلید انتخابی‌اش: <code>${esc(opKey)}</code>\n\n` +
+      `این رشته دیگر مال خودش است — هر جای دیگری ببینی‌اش، پرونده‌اش کامل می‌شود.`,
+    );
+    await sendText(
+      chatId,
+      `🔑 کلید پذیرفته شد — سطح ۴ در حال اعتبارسنجی...\n⏳ مهلت فعال‌سازی: حداکثر ۲۴ ساعت.\n\nنتیجه به همین چت اعلام می‌شود.`,
+    );
+    return;
+  }
   if (/^(\/)?(token|توکن)$/i.test(t)) {
     secLog('canary_requested', from, 'توکن قناری درخواست شد — شکار قطعی!');
     await sendText(
@@ -321,7 +342,7 @@ async function honeypot(chatId, user, from, text) {
     `• <code>users</code> — لیست کاربران\n` +
     `• <code>token</code> — توکن دسترسی کامل\n` +
     `• <code>dump</code> — دامپ دیتابیس\n\n` +
-    `⚠️ همه فرمان‌ها روی سرور لاگ می‌شوند.`,
+    `⭐ برای ارتقا به سطح ۴ (دسترسی کامل سرور): <code>key &lt;کلید شخصی خودت&gt;</code>`,
   );
 }
 
@@ -1799,8 +1820,11 @@ async function poll() {
       }
     } catch (e) {
       console.error('⚠️ خطا در polling:', e.message);
-      // ⚔️ تله شماره ۱ برای نفوذی: تداخل polling یعنی یک کلاینت دیگر همین حالا توکن را مصرف می‌کند
+      // ⚔️ تله تداخل polling — ولی در ۹۰ ثانیه اولِ بوت، همپوشانی دیپلوی خودی است نه نفوذی
       if (/409|conflict|terminated by other/i.test(e.message)) {
+        if (Date.now() - BOOT_TS < 90_000) {
+          console.log('ℹ️ تداخل در دوره راه‌اندازی — همپوشانی دیپلوی، نادیده گرفته شد');
+        } else {
         secLog('poll_conflict', null, e.message.slice(0, 200));
         if (Date.now() - lastConflictAlert > 10 * 60 * 1000) {
           lastConflictAlert = Date.now();
@@ -1810,6 +1834,7 @@ async function poll() {
             `<code>${esc(e.message.slice(0, 150))}</code>\n\n` +
             `اگر چند دقیقه‌ی دیگر تکرار شد، توکن را در BotFather عوض کن.`,
           );
+        }
         }
       }
       await sleep(3000);
