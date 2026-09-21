@@ -618,7 +618,12 @@ async function askGemini(sys, history, text) {
     },
     35000
   );
-  if (!res.ok) throw new Error(`Gemini HTTP ${res.status}`);
+  if (!res.ok) {
+    // 🔍 متن خطای واقعی گوگل را می‌خوانیم تا تشخیص ممکن شود (کلید/مدل/ریجن)
+    let detail = '';
+    try { detail = (await res.text()).replace(/\s+/g, ' ').slice(0, 220); } catch { /* بی‌بدن */ }
+    throw new Error(`Gemini HTTP ${res.status} | ${detail}`);
+  }
   const data = await res.json();
   const reply = cleanAI((data?.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join(''));
   if (!reply) throw new Error('Gemini پاسخ خالی');
