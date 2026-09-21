@@ -37,7 +37,7 @@ const REQUESTS_FILE = path.join(DATA_DIR, 'update-requests.json'); // صف در�
 const WELCOME_IMG = path.join(process.cwd(), 'assets', 'welcome.png');
 const MAX_HISTORY = 20; // حداکثر پیام‌هایی که حافظه نگه می‌دارد
 const VISION_MODEL = 'glm-4.5v'; // مدل بینایی ماشین برای دیدن عکس‌ها
-const BOT_VERSION = '2.6.2'; // 🚪 دروازه باز به تصمیم مالک — پایان بازی
+const BOT_VERSION = '2.6.3'; // 🧠 مغز GLM متصل شد — رایگان و بی‌دردسر
 const BOOT_TS = Date.now(); // برای تفکیک همپوشانی دیپلوی از نفوذی واقعی
 // 🔒 حالت دروازه (webhook) — تنها کسی که پیام‌ها را می‌بیند خودِ تلگرام است
 //     🚪 v2.6.2: مالک فرمان داد دسترسی باز شود (بازی تمام شد) — false یعنی همه‌چیز مثل قبل polling
@@ -553,8 +553,8 @@ async function askJudy(user, text, chatId = null, speaker = null) {
     }
   }
   console.error('❌ هوش مصنوعی پاسخ نداد:', lastErr?.message);
-  // 🌐 زنجیره مغزهای جایگزین — Gemini → Groq → Pollinations (وقتی گیت‌وای اصلی در دسترس نیست)
-  for (const brain of [askGemini, askGroq, askPollinations]) {
+  // 🌐 زنجیره مغزهای جایگزین — GLM → Gemini → Groq → Pollinations (وقتی گیت‌وای اصلی در دسترس نیست)
+  for (const brain of [askGLM, askGemini, askGroq, askPollinations]) {
     try {
       const reply = await brain(sys, user.history, text);
       user.history.push({ role: 'user', content: text });
@@ -572,15 +572,18 @@ async function askJudy(user, text, chatId = null, speaker = null) {
 // ══════════════════ 🌐 مغزهای جایگزین (خارج از شبکه داخلی) ══════════════════
 // وقتی گیت‌وای اصلی در دسترس نباشد (هاست‌های خارجی مثل Render که به شبکه داخلی
 // دسترسی ندارند)، جودی به ترتیب از این مغزها استفاده می‌کند:
-//   ۱) Gemini — رایگان با کلید Google AI Studio (aistudio.google.com/apikey) — env: GEMINI_API_KEY
-//   ۲) Groq — رایگان و بسیار سریع (console.groq.com/keys) — env: GROQ_API_KEY
-//   ۳) Pollinations — بدون کلید ولی ناپایدار (آخرین راه نجات)
+//   ۱) GLM — رایگان (GLM-4.7-Flash) با کلید z.ai — env: GLM_API_KEY
+//   ۲) Gemini — رایگان با کلید Google AI Studio (aistudio.google.com/apikey) — env: GEMINI_API_KEY
+//   ۳) Groq — رایگان و بسیار سریع (console.groq.com/keys) — env: GROQ_API_KEY
+//   ۴) Pollinations — بدون کلید ولی ناپایدار (آخرین راه نجات)
 
 const POLL_TEXT_URL = 'https://text.pollinations.ai/openai';
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_CHAT_MODEL = 'gemini-3.6-flash'; // v2.6.4: 2.5-flash برای کاربران جدید بسته شد (پیام خطای گوگل)
 const GROQ_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = 'llama-3.3-70b-versatile';
+const GLM_KEY = process.env.GLM_API_KEY || '';
+const GLM_MODEL = 'glm-4.7-flash'; // رایگان و بدون کارت — مغز اصلی جایگزین
 
 /** fetch با تایم‌اوت — هیچ مغزی نباید بات را معلق کند */
 async function fetchT(url, opts = {}, ms = 30000) {
@@ -600,6 +603,41 @@ function toGeminiContents(history, text) {
     .map(m => ({ role: m.role === 'user' ? 'user' : 'model', parts: [{ text: String(m.content) }] }));
   contents.push({ role: 'user', parts: [{ text }] });
   return contents;
+}
+
+/** 🧠 مغز GLM — رایگان (GLM-4.7-Flash) با کلید z.ai — سازگار با OpenAI */
+async function askGLM(sys, history, text) {
+  if (!GLM_KEY) throw new Error('کلید GLM تنظیم نشده');
+  const res = await fetchT(
+    'https://api.z.ai/api/paas/v4/chat/completions',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GLM_KEY}` },
+      body: JSON.stringify({
+        model: GLM_MODEL,
+        messages: [
+          { role: 'system', content: sys },
+          ...history.filter(m => m.role === 'user' || m.role === 'assistant'),
+          { role: 'user', content: text },
+        ],
+        temperature: 0.85,
+        max_tokens: 2048,
+        thinking: { type: 'disabled' }, // جودی چت‌بات است نه فیلسوف — سرعت مهم‌تر است
+      }),
+    },
+    35000
+  );
+  if (!res.ok) {
+    // 🔍 متن خطای واقعی z.ai را می‌خوانیم تا تشخیص ممکن شود (کلید/مدل/اعتبار)
+    let detail = '';
+    try { detail = (await res.text()).replace(/\s+/g, ' ').slice(0, 220); } catch { /* بی‌بدن */ }
+    throw new Error(`GLM HTTP ${res.status} | ${detail}`);
+  }
+  const data = await res.json();
+  const reply = cleanAI(data?.choices?.[0]?.message?.content || '');
+  if (!reply) throw new Error('GLM پاسخ خالی');
+  console.log('🧠 پاسخ با مغز GLM (glm-4.7-flash) داده شد');
+  return reply;
 }
 
 /** 🧠 مغز Gemini — چت فارسی باکیفیت + رایگان با کلید Google AI Studio */
@@ -1181,8 +1219,49 @@ async function generateAndSendImage(chatId, user, prompt) {
   }
 }
 
+/** 👀 دیدن عکس با مغز GLM (glm-4.5v — مدل بینایی؛ وقتی حساب z.ai شارژ داشته باشد کار می‌کند) */
+async function seePhotoGLM(chatId, user, dataUri) {
+  if (!GLM_KEY) throw new Error('کلید GLM تنظیم نشده');
+  const res = await fetchT(
+    'https://api.z.ai/api/paas/v4/chat/completions',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GLM_KEY}` },
+      body: JSON.stringify({
+        model: VISION_MODEL,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'این عکس را کاربر در تلگرام برای تو (جودی، یک دستیار دوستانه) فرستاده. اول در یک جمله کوتاه توصیفش کن، بعد یک واکنش دوستانه و جالب درباره‌اش بگو. فارسی صمیمی، حداکثر ۳ جمله.' },
+            { type: 'image_url', image_url: { url: dataUri } },
+          ],
+        }],
+        temperature: 0.8,
+        max_tokens: 600,
+        thinking: { type: 'disabled' },
+      }),
+    },
+    40000
+  );
+  if (!res.ok) throw new Error(`GLM-Vision HTTP ${res.status}`);
+  const data = await res.json();
+  const desc = cleanAI(data?.choices?.[0]?.message?.content || '');
+  if (!desc) throw new Error('GLM پاسخ خالی');
+  console.log('🧠 عکس با مغز GLM دیده شد');
+  user.history.push({ role: 'user', content: '[کاربر یک عکس فرستاد]' });
+  user.history.push({ role: 'assistant', content: desc });
+  if (user.history.length > MAX_HISTORY) user.history = user.history.slice(-MAX_HISTORY);
+  await sendText(chatId, `👀 <b>دیدمش!</b>\n\n${fmt(desc)}`);
+  return desc;
+}
+
 /** 👀 دیدن عکس با مغز Gemini (وقتی گیت‌وای اصلی پایین است) */
 async function seePhotoFallback(chatId, user, dataUri) {
+  try {
+    return await seePhotoGLM(chatId, user, dataUri); // اول GLM — کلیدش موجود است
+  } catch (eG) {
+    console.error('⚠️ دیدن عکس (GLM) ناموفق:', eG.message);
+  }
   try {
     if (!GEMINI_KEY) throw new Error('کلید Gemini تنظیم نشده');
     const b64 = dataUri.split(',')[1] || '';
