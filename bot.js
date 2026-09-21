@@ -37,7 +37,7 @@ const REQUESTS_FILE = path.join(DATA_DIR, 'update-requests.json'); // صف در�
 const WELCOME_IMG = path.join(process.cwd(), 'assets', 'welcome.png');
 const MAX_HISTORY = 20; // حداکثر پیام‌هایی که حافظه نگه می‌دارد
 const VISION_MODEL = 'glm-4.5v'; // مدل بینایی ماشین برای دیدن عکس‌ها
-const BOT_VERSION = '2.6.0'; // 🔒 دروازه بسته — تحویل وب‌هوک با گارد خودترمیم
+const BOT_VERSION = '2.6.1'; // 🔒 دروازه بسته — رفع باگ تشخیص موفقیت ست‌وب‌هوک (حلقه 409 خودی)
 const BOOT_TS = Date.now(); // برای تفکیک همپوشانی دیپلوی از نفوذی واقعی
 // 🔒 حالت دروازه (webhook) — تنها کسی که پیام‌ها را می‌بیند خودِ تلگرام است
 //     با ست‌شدن وب‌هوک، هر getUpdates خارجی برای همیشه 409 می‌گیرد = شنود مسدود
@@ -271,8 +271,11 @@ async function alertOwner(text) {
 
 let lastConflictAlert = 0; // ضداسپم آلارم تداخل polling
 
-/** 🔒 نصب دروازه — وب‌هوک خودمان با رمز مخفی (رمز فقط در Env رندر است، در ریپو نیست) */
-async function setWebhookGuarded() {
+/** 🔒 نصب دروازه — وب‌هوک خودمان با رمز مخفی (رمز فقط در Env رندر است، در ریپو نیست)
+ *  ⚠️ tg() در موفقیت json.result برمی‌گرداند (برای setWebhook یعنی true) و در شکست throw می‌کند.
+ *  v2.6.0 به اشتباه res.ok را چک می‌کرد → موفقیت «ناموفق» تشخیص داده می‌شد → fallback به polling
+ *  → 409 ابدی با دروازه خودمان → واچ‌داگ پروسه را می‌کشت → حلقه بی‌پایان ری‌استارت. */
+async function setWebhookGuarded(attempts = 3) {
   const params = {
     url: WEBHOOK_URL,
     allowed_updates: ['message', 'callback_query', 'my_chat_member'],
@@ -280,9 +283,18 @@ async function setWebhookGuarded() {
     max_connections: 40,
   };
   if (WEBHOOK_SECRET) params.secret_token = WEBHOOK_SECRET;
-  const res = await tg('setWebhook', params);
-  console.log(`🔒 دروازه وب‌هوک: ${res && res.ok ? 'بسته شد ✅' : 'ناموفق ❌ ' + JSON.stringify(res).slice(0, 120)}`);
-  return res;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const res = await tg('setWebhook', params);
+      const success = res === true || (res && typeof res === 'object' && res.ok === true);
+      console.log(`🔒 دروازه وب‌هوک: ${success ? `بسته شد ✅ (تلاش ${i}/${attempts})` : 'ناموفق ❌ ' + JSON.stringify(res).slice(0, 120)}`);
+      return success;
+    } catch (e) {
+      console.error(`⚠️ ست وب‌هوک (تلاش ${i}/${attempts}) ناموفق: ${e.message}`);
+      if (i < attempts) await sleep(5000);
+    }
+  }
+  return false;
 }
 
 function startSecurityWatch() {
@@ -1922,14 +1934,15 @@ async function main() {
   console.log('══════════════════════════════════');
   startKeepaliveServer();
   if (USE_WEBHOOK) {
-    const ok = await setWebhookGuarded().catch(() => null);
-    if (ok && ok.ok) {
+    const ok = await setWebhookGuarded(); // با ریترای داخلی
+    if (ok) {
       console.log('🔒 دروازه بسته شد — هیچ getUpdates بیرونی دیگر نمی‌تواند پیام‌ها را ببیند (409 ابدی)');
       startSecurityWatch(); // 🛡️ گارد خودترمیم هر ۴۵ ثانیه
       await applyMenuGame(); // 🎭 منوی دوگانه: تله برای ناظر، منوی واقعی برای ویل
       return; // polling هرگز اجرا نمی‌شود (وگرنه با خودمان 409 می‌گیریم)
     }
-    console.error('⚠️ دروازه بسته نشد — به حالت polling برمی‌گردم');
+    console.error('⚠️ دروازه بعد از ۳ تلاش بسته نشد — اول وب‌هوک خارجی را پاک می‌کنم تا با خودم 409 نگیرم');
+    await tg('deleteWebhook', { drop_pending_updates: false }).catch(() => {});
   }
   startSecurityWatch(); // 🕵️ نگهبان ضدنفوذ بیدار شد
   await poll();
