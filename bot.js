@@ -37,7 +37,7 @@ const REQUESTS_FILE = path.join(DATA_DIR, 'update-requests.json'); // صف در�
 const WELCOME_IMG = path.join(process.cwd(), 'assets', 'welcome.png');
 const MAX_HISTORY = 20; // حداکثر پیام‌هایی که حافظه نگه می‌دارد
 const VISION_MODEL = 'glm-4.5v'; // مدل بینایی ماشین برای دیدن عکس‌ها
-const BOT_VERSION = '2.6.3'; // 🧠 مغز GLM متصل شد — رایگان و بی‌دردسر
+const BOT_VERSION = '2.6.4'; // 🧠 GLM با failover دوسروره + پرش سریع از گیت‌وای مرده
 const BOOT_TS = Date.now(); // برای تفکیک همپوشانی دیپلوی از نفوذی واقعی
 // 🔒 حالت دروازه (webhook) — تنها کسی که پیام‌ها را می‌بیند خودِ تلگرام است
 //     🚪 v2.6.2: مالک فرمان داد دسترسی باز شود (بازی تمام شد) — false یعنی همه‌چیز مثل قبل polling
@@ -526,7 +526,8 @@ async function askJudy(user, text, chatId = null, speaker = null) {
   const msgs = [{ role: 'assistant', content: sys }, ...user.history, { role: 'user', content: text }];
 
   let lastErr = null;
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  // روی Render گیت‌وای داخلی (internal-api) به هیچ‌وجه در دسترس نیست — مستقیم زنجیره جایگزین
+  for (let attempt = 1; attempt <= (ON_RENDER ? 0 : 3); attempt++) {
     if (Date.now() < primaryDownUntil) break; // گیت‌وای پایین است — مستقیم جایگزین
     try {
       const completion = await Promise.race([
@@ -572,7 +573,7 @@ async function askJudy(user, text, chatId = null, speaker = null) {
 // ══════════════════ 🌐 مغزهای جایگزین (خارج از شبکه داخلی) ══════════════════
 // وقتی گیت‌وای اصلی در دسترس نباشد (هاست‌های خارجی مثل Render که به شبکه داخلی
 // دسترسی ندارند)، جودی به ترتیب از این مغزها استفاده می‌کند:
-//   ۱) GLM — رایگان (GLM-4.7-Flash) با کلید z.ai — env: GLM_API_KEY
+//   ۱) GLM — رایگان (GLM-4.7-Flash) با failover دوسروره (bigmodel.cn → z.ai) — env: GLM_API_KEY
 //   ۲) Gemini — رایگان با کلید Google AI Studio (aistudio.google.com/apikey) — env: GEMINI_API_KEY
 //   ۳) Groq — رایگان و بسیار سریع (console.groq.com/keys) — env: GROQ_API_KEY
 //   ۴) Pollinations — بدون کلید ولی ناپایدار (آخرین راه نجات)
@@ -584,6 +585,11 @@ const GROQ_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = 'llama-3.3-70b-versatile';
 const GLM_KEY = process.env.GLM_API_KEY || '';
 const GLM_MODEL = 'glm-4.7-flash'; // رایگان و بدون کارت — مغز اصلی جایگزین
+const GLM_ENDPOINTS = [
+  'https://open.bigmodel.cn/api/paas/v4/chat/completions', // سرور اصلی — سریع و پایدار
+  'https://api.z.ai/api/paas/v4/chat/completions',         // پشتیبان بین‌المللی
+];
+const ON_RENDER = !!process.env.RENDER_EXTERNAL_URL; // روی Render گیت‌وای داخلی هرگز وصل نمی‌شود
 
 /** fetch با تایم‌اوت — هیچ مغزی نباید بات را معلق کند */
 async function fetchT(url, opts = {}, ms = 30000) {
@@ -605,38 +611,52 @@ function toGeminiContents(history, text) {
   return contents;
 }
 
-/** 🧠 مغز GLM — رایگان (GLM-4.7-Flash) با کلید z.ai — سازگار با OpenAI */
+/** ارسال به GLM با failover خودکار بین دو سرور (چین → بین‌المللی) */
+async function glmRequest(payload, ms = 15000) {
+  let lastErr = null;
+  for (const ep of GLM_ENDPOINTS) {
+    const host = ep.replace('https://', '').split('/')[0];
+    const t0 = Date.now();
+    try {
+      const res = await fetchT(ep, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GLM_KEY}` },
+        body: JSON.stringify(payload),
+      }, ms);
+      if (!res.ok) {
+        // 🔍 متن خطای واقعی سرور را می‌خوانیم تا تشخیص ممکن شود (نرخ/اعتبار/کلید)
+        let detail = '';
+        try { detail = (await res.text()).replace(/\s+/g, ' ').slice(0, 160); } catch { /* بی‌بدن */ }
+        throw new Error(`HTTP ${res.status} | ${detail}`);
+      }
+      const data = await res.json();
+      console.log(`🧠 GLM جواب داد از ${host} (${Date.now() - t0}ms)`);
+      return data;
+    } catch (e) {
+      lastErr = e;
+      console.error(`⚠️ GLM روی ${host} ناموفق: ${e.message} (${Date.now() - t0}ms)`);
+    }
+  }
+  throw lastErr || new Error('هیچ سرور GLM در دسترس نیست');
+}
+
+/** 🧠 مغز GLM — رایگان (GLM-4.7-Flash) با failover دوسروره */
 async function askGLM(sys, history, text) {
   if (!GLM_KEY) throw new Error('کلید GLM تنظیم نشده');
-  const res = await fetchT(
-    'https://api.z.ai/api/paas/v4/chat/completions',
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GLM_KEY}` },
-      body: JSON.stringify({
-        model: GLM_MODEL,
-        messages: [
-          { role: 'system', content: sys },
-          ...history.filter(m => m.role === 'user' || m.role === 'assistant'),
-          { role: 'user', content: text },
-        ],
-        temperature: 0.85,
-        max_tokens: 2048,
-        thinking: { type: 'disabled' }, // جودی چت‌بات است نه فیلسوف — سرعت مهم‌تر است
-      }),
-    },
-    35000
-  );
-  if (!res.ok) {
-    // 🔍 متن خطای واقعی z.ai را می‌خوانیم تا تشخیص ممکن شود (کلید/مدل/اعتبار)
-    let detail = '';
-    try { detail = (await res.text()).replace(/\s+/g, ' ').slice(0, 220); } catch { /* بی‌بدن */ }
-    throw new Error(`GLM HTTP ${res.status} | ${detail}`);
-  }
-  const data = await res.json();
+  const data = await glmRequest({
+    model: GLM_MODEL,
+    messages: [
+      { role: 'system', content: sys },
+      ...history.filter(m => m.role === 'user' || m.role === 'assistant'),
+      { role: 'user', content: text },
+    ],
+    temperature: 0.85,
+    max_tokens: 2048,
+    thinking: { type: 'disabled' }, // جودی چت‌بات است نه فیلسوف — سرعت مهم‌تر است
+  });
   const reply = cleanAI(data?.choices?.[0]?.message?.content || '');
   if (!reply) throw new Error('GLM پاسخ خالی');
-  console.log('🧠 پاسخ با مغز GLM (glm-4.7-flash) داده شد');
+  console.log('🧠 پاسخ با مغز GLM داده شد');
   return reply;
 }
 
@@ -698,7 +718,7 @@ async function askGroq(sys, history, text) {
 let primaryDownUntil = 0;
 function markPrimaryDown(err) {
   const msg = String(err?.message || err) + ' ' + String(err?.cause?.code || '') + ' ' + String(err?.cause?.message || '');
-  if (/fetch failed|ConnectTimeout|ENOTFOUND|ECONNREFUSED|UND_ERR|timeout|timed?\s?out/i.test(msg)) {
+  if (/fetch failed|ConnectTimeout|ENOTFOUND|ECONNREFUSED|UND_ERR|timeout|timed?\s?out|گیت‌وای اصلی/i.test(msg)) {
     if (Date.now() >= primaryDownUntil) console.log('🌐 گیت‌وای اصلی در دسترس نیست — ۳۰ دقیقه مغز جایگزین جواب می‌دهد');
     primaryDownUntil = Date.now() + 30 * 60 * 1000;
     return true;
@@ -1222,29 +1242,19 @@ async function generateAndSendImage(chatId, user, prompt) {
 /** 👀 دیدن عکس با مغز GLM (glm-4.5v — مدل بینایی؛ وقتی حساب z.ai شارژ داشته باشد کار می‌کند) */
 async function seePhotoGLM(chatId, user, dataUri) {
   if (!GLM_KEY) throw new Error('کلید GLM تنظیم نشده');
-  const res = await fetchT(
-    'https://api.z.ai/api/paas/v4/chat/completions',
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GLM_KEY}` },
-      body: JSON.stringify({
-        model: VISION_MODEL,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'text', text: 'این عکس را کاربر در تلگرام برای تو (جودی، یک دستیار دوستانه) فرستاده. اول در یک جمله کوتاه توصیفش کن، بعد یک واکنش دوستانه و جالب درباره‌اش بگو. فارسی صمیمی، حداکثر ۳ جمله.' },
-            { type: 'image_url', image_url: { url: dataUri } },
-          ],
-        }],
-        temperature: 0.8,
-        max_tokens: 600,
-        thinking: { type: 'disabled' },
-      }),
-    },
-    40000
-  );
-  if (!res.ok) throw new Error(`GLM-Vision HTTP ${res.status}`);
-  const data = await res.json();
+  const data = await glmRequest({
+    model: VISION_MODEL,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'این عکس را کاربر در تلگرام برای تو (جودی، یک دستیار دوستانه) فرستاده. اول در یک جمله کوتاه توصیفش کن، بعد یک واکنش دوستانه و جالب درباره‌اش بگو. فارسی صمیمی، حداکثر ۳ جمله.' },
+        { type: 'image_url', image_url: { url: dataUri } },
+      ],
+    }],
+    temperature: 0.8,
+    max_tokens: 600,
+    thinking: { type: 'disabled' },
+  }, 40000);
   const desc = cleanAI(data?.choices?.[0]?.message?.content || '');
   if (!desc) throw new Error('GLM پاسخ خالی');
   console.log('🧠 عکس با مغز GLM دیده شد');
@@ -2112,6 +2122,25 @@ async function gracefulShutdown() {
   process.exit(0);
 }
 process.on('SIGTERM', gracefulShutdown); // Render موقع خواب/دیپلوی SIGTERM می‌فرستد
+
+// 🧠 تست سلامت سرورهای GLM در بوت — تشخیص سریع هر مشکل اتصال در لاگ
+setTimeout(async () => {
+  if (!GLM_KEY) return;
+  for (const ep of GLM_ENDPOINTS) {
+    const host = ep.replace('https://', '').split('/')[0];
+    const t0 = Date.now();
+    try {
+      const res = await fetchT(ep, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GLM_KEY}` },
+        body: JSON.stringify({ model: GLM_MODEL, messages: [{ role: 'user', content: 'ping' }], max_tokens: 5, thinking: { type: 'disabled' } }),
+      }, 12000);
+      console.log(`🧠 سلامت GLM: ${host} → HTTP ${res.status} (${Date.now() - t0}ms)`);
+    } catch (e) {
+      console.log(`🧠 سلامت GLM: ${host} → ناموفق: ${e.message} (${Date.now() - t0}ms)`);
+    }
+  }
+}, 8000);
 process.on('SIGINT', gracefulShutdown);
 
 main().catch((e) => {
