@@ -578,7 +578,7 @@ async function askJudy(user, text, chatId = null, speaker = null) {
 
 const POLL_TEXT_URL = 'https://text.pollinations.ai/openai';
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
-const GEMINI_CHAT_MODEL = 'gemini-2.5-flash';
+const GEMINI_CHAT_MODEL = 'gemini-3.6-flash'; // v2.6.4: 2.5-flash برای کاربران جدید بسته شد (پیام خطای گوگل)
 const GROQ_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = 'llama-3.3-70b-versatile';
 
