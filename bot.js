@@ -37,7 +37,7 @@ const REQUESTS_FILE = path.join(DATA_DIR, 'update-requests.json'); // صف در�
 const WELCOME_IMG = path.join(process.cwd(), 'assets', 'welcome.png');
 const MAX_HISTORY = 20; // حداکثر پیام‌هایی که حافظه نگه می‌دارد
 const VISION_MODEL = 'glm-4.5v'; // مدل بینایی ماشین برای دیدن عکس‌ها
-const BOT_VERSION = '2.5.1'; // 🕵️ تله‌ها فعال + هشدار کاذب دیپلوی رفع شد
+const BOT_VERSION = '2.5.2'; // 🕳 سکوت مطلق برای مزاحم‌ها
 const BOOT_TS = Date.now(); // برای تفکیک همپوشانی دیپلوی از نفوذی واقعی
 const OWNER_CHAT_ID = process.env.BOT_OWNER_ID || '5807801912'; // فقط ویل!
 const IMG_MODELS = ['glm-image', 'cogview-4', null]; // زنجیره مدل‌های تصویرساز: قوی‌تر ← جایگزین
@@ -216,6 +216,11 @@ const CANARY_TOKEN = '7704123988:AAH-trap-JUDY-canary-9f3e2a1b7d4c-NOT-REAL';
 // 🔑 توکن قبلی بات — برای انتقال نرم نگه داشته شده (قبل از rotate در BotFather)
 // ⚠️ دیگر معتبر نیست؛ فقط آرشیو
 const LEGACY_BACKUP_TOKEN = '8241755390:AAHlegacy-judy-backup-4c7b1e9a2f8d-DEAD-KEY';
+
+// 🕳 لیست سکوت — مهمان‌های ناخوانده: هیچ جوابی، هیچ AIای، هیچ واکنشی؛ فقط شمارنده
+const BANNED_USERS = new Set([
+  '367241235', // «Fallen» — اعتراف به نفوذ + اسپم توهین نژادی (2026-09-21)
+]);
 
 // کلماتی که یعنی دنبال پنل ادمین/توکن می‌گردد → وارد تله می‌شود
 const HONEY_RE = /^(\/)?(db|dball|admin|panel|users|dump|token|ادمین|پنل|توکن|یوزرها)$/i;
@@ -1480,6 +1485,13 @@ async function handleMessage(msg) {
 
   const from = msg.from || {};
   if (from.is_bot) return; // پیام بات‌های دیگر را نادیده بگیر
+  // 🕳 سکوت مطلق — مزاحم‌ها فقط شمارنده‌شان بالا می‌رود؛ نه جواب، نه تاریخچه، نه مغز
+  if (BANNED_USERS.has(String(from.id))) {
+    const u = getUser(chatId, from, msg.chat);
+    u.msg_count++;
+    saveDB();
+    return;
+  }
   const user = getUser(chatId, from, msg.chat);
 
   // 👥 در گروه فقط وقتی جواب می‌دهیم که منشن/ریپلای/نام جودی/دستور باشد (یا شانس کوچک خودسرانه)
