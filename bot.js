@@ -37,8 +37,15 @@ const REQUESTS_FILE = path.join(DATA_DIR, 'update-requests.json'); // صف در�
 const WELCOME_IMG = path.join(process.cwd(), 'assets', 'welcome.png');
 const MAX_HISTORY = 20; // حداکثر پیام‌هایی که حافظه نگه می‌دارد
 const VISION_MODEL = 'glm-4.5v'; // مدل بینایی ماشین برای دیدن عکس‌ها
-const BOT_VERSION = '2.5.2'; // 🕳 سکوت مطلق برای مزاحم‌ها
+const BOT_VERSION = '2.6.0'; // 🔒 دروازه بسته — تحویل وب‌هوک با گارد خودترمیم
 const BOOT_TS = Date.now(); // برای تفکیک همپوشانی دیپلوی از نفوذی واقعی
+// 🔒 حالت دروازه (webhook) — تنها کسی که پیام‌ها را می‌بیند خودِ تلگرام است
+//     با ست‌شدن وب‌هوک، هر getUpdates خارجی برای همیشه 409 می‌گیرد = شنود مسدود
+const USE_WEBHOOK = true;
+const WEBHOOK_PATH = '/tg-webhook';
+const WEBHOOK_URL = (process.env.RENDER_EXTERNAL_URL || 'https://judy-bot-1ocr.onrender.com').replace(/\/+$/, '') + WEBHOOK_PATH;
+const WEBHOOK_SECRET = process.env.TG_WEBHOOK_SECRET || '';
+const WEBHOOK_CHECK_MS = 45 * 1000; // گارد هر ۴۵ ثانیه سلامت دروازه را چک می‌کند
 const OWNER_CHAT_ID = process.env.BOT_OWNER_ID || '5807801912'; // فقط ویل!
 const IMG_MODELS = ['glm-image', 'cogview-4', null]; // زنجیره مدل‌های تصویرساز: قوی‌تر ← جایگزین
 const GROUP_RANDOM_CHANCE = 0.08; // شانس پاسخ خودسرانه جودی در گروه‌ها (زنده بودن!)
@@ -264,12 +271,42 @@ async function alertOwner(text) {
 
 let lastConflictAlert = 0; // ضداسپم آلارم تداخل polling
 
-/** 🕵️ نگهبان هر ۵ دقیقه — نظارت روی وب‌هوک (ابزار کلاسیک دزدان توکن) */
+/** 🔒 نصب دروازه — وب‌هوک خودمان با رمز مخفی (رمز فقط در Env رندر است، در ریپو نیست) */
+async function setWebhookGuarded() {
+  const params = {
+    url: WEBHOOK_URL,
+    allowed_updates: ['message', 'callback_query', 'my_chat_member'],
+    drop_pending_updates: false,
+    max_connections: 40,
+  };
+  if (WEBHOOK_SECRET) params.secret_token = WEBHOOK_SECRET;
+  const res = await tg('setWebhook', params);
+  console.log(`🔒 دروازه وب‌هوک: ${res && res.ok ? 'بسته شد ✅' : 'ناموفق ❌ ' + JSON.stringify(res).slice(0, 120)}`);
+  return res;
+}
+
 function startSecurityWatch() {
   const watch = async () => {
     try {
       const info = await tg('getWebhookInfo', {});
-      if (info && info.url) {
+      if (!info) return;
+      if (USE_WEBHOOK) {
+        // 🛡️ گارد خودترمیم — اگر کسی وب‌هوک را پاک/عوض کند، تا ۴۵ ثانیه برمی‌گردد
+        const url = info.url || '';
+        if (url !== WEBHOOK_URL) {
+          secLog('webhook_restored', null, `دروازه خراب بود (${url || 'خالی'}) — بازسازی شد`);
+          await setWebhookGuarded().catch(() => {});
+          await alertOwner(
+            `🔒 <b>دروازه تحت حمله بود — بازسازی شد.</b>\n\n` +
+            `کسی با توکن وب‌هوک را پاک/عوض کرده بود تا دوباره پیام‌ها را بخواند.\n` +
+            `وب‌هوک قبلی: <code>${esc(String(url || 'خالی').slice(0, 120))}</code>\n` +
+            `الان دوباره بسته شد ✅ — هر تلاش بعدی همین آلارم را می‌دهد.`,
+          );
+        } else if (info.last_error_message && Date.now() - (startSecurityWatch.__lastErrLog || 0) > 10 * 60 * 1000) {
+          startSecurityWatch.__lastErrLog = Date.now();
+          secLog('webhook_delivery_error', null, String(info.last_error_message).slice(0, 180));
+        }
+      } else if (info.url) {
         secLog('webhook_hijack', null, `وب‌هوک خارجی: ${info.url}`);
         await alertOwner(
           `🕸 <b>وب‌هوک خارجی روی توکن تو وصل شد!</b>\n\n` +
@@ -282,9 +319,9 @@ function startSecurityWatch() {
       console.error('⚠️ نگهبان امنیتی:', e.message);
     }
   };
-  setTimeout(watch, 20_000);
-  setInterval(watch, 5 * 60 * 1000);
-  console.log('🕵️ نگهبان امنیتی هر ۵ دقیقه بیدار است (نظارت وب‌هوک)');
+  setTimeout(watch, 15_000);
+  setInterval(watch, WEBHOOK_CHECK_MS);
+  console.log(`🕵️ نگهبان امنیتی هر ${WEBHOOK_CHECK_MS / 1000} ثانیه بیدار است (گارد دروازه)`);
 }
 
 /** 🎭 پنل قلابی — هر کس غیر از ویل دنبال پنل ادمین بگردد وارد این بازی می‌شود */
@@ -1489,6 +1526,11 @@ async function handleMessage(msg) {
   if (BANNED_USERS.has(String(from.id))) {
     const u = getUser(chatId, from, msg.chat);
     u.msg_count++;
+    // 🕳 مدرک‌گیری خاموش — حرف‌های مسدودشده‌ها هر ۵ دقیقه یک‌بار در دفتر امنیتی می‌مانند
+    if (!u.__lastSilentLog || Date.now() - u.__lastSilentLog > 5 * 60 * 1000) {
+      u.__lastSilentLog = Date.now();
+      secLog('silenced', from, String(msg.text || msg.caption || '').slice(0, 120));
+    }
     saveDB();
     return;
   }
@@ -1879,8 +1921,41 @@ async function main() {
   console.log(`🤖 بات جودی آنلاین شد!  @${me.username}`);
   console.log('══════════════════════════════════');
   startKeepaliveServer();
+  if (USE_WEBHOOK) {
+    const ok = await setWebhookGuarded().catch(() => null);
+    if (ok && ok.ok) {
+      console.log('🔒 دروازه بسته شد — هیچ getUpdates بیرونی دیگر نمی‌تواند پیام‌ها را ببیند (409 ابدی)');
+      startSecurityWatch(); // 🛡️ گارد خودترمیم هر ۴۵ ثانیه
+      await applyMenuGame(); // 🎭 منوی دوگانه: تله برای ناظر، منوی واقعی برای ویل
+      return; // polling هرگز اجرا نمی‌شود (وگرنه با خودمان 409 می‌گیریم)
+    }
+    console.error('⚠️ دروازه بسته نشد — به حالت polling برمی‌گردم');
+  }
   startSecurityWatch(); // 🕵️ نگهبان ضدنفوذ بیدار شد
   await poll();
+}
+
+/** 🎭 بازی منو — ناظر توکن بعد از قفل فقط getMyCommands را هنوز می‌بیند؛ پس منوی پیش‌فرض پیام خودش را دارد */
+async function applyMenuGame() {
+  try {
+    const taunt = [
+      { command: 'access_denied', description: 'you know why.' },
+      { command: 'try_something_else', description: 'the window is bricked. the door is steel.' },
+      { command: 'gg', description: 'well played. the house always wins.' },
+    ];
+    const real = [
+      { command: 'start', description: 'شروع جودی' },
+      { command: 'menu', description: 'منوی اصلی' },
+      { command: 'help', description: 'راهنما' },
+      { command: 'reset', description: 'پاک کردن حافظه گفتگو' },
+      { command: 'spy', description: 'گزارش امنیتی (فقط ویل)' },
+    ];
+    await tg('setMyCommands', { commands: taunt }); // پیش‌فرض = همه‌جا به‌جز اسکوپ‌های خاص‌تر
+    await tg('setMyCommands', { commands: real, scope: { type: 'chat', chat_id: Number(OWNER_CHAT_ID) } });
+    console.log('🎭 منوی دوگانه نصب شد: ناظر پیام خودش را می‌بیند، ویل منوی واقعی را دارد');
+  } catch (e) {
+    console.error('⚠️ منوی دوگانه نصب نشد:', e.message);
+  }
 }
 
 /** 🌐 وب‌سرور Keepalive — برای هاست‌های رایگان مثل Render که ترافیک HTTP می‌خواهند */
@@ -1889,6 +1964,28 @@ function startKeepaliveServer() {
   if (!PORT) return; // لوکال لازم نیست
   try {
     http.createServer((req, res) => {
+      // 🔒 درگاه رسمی تلگرام — فقط با رمز مخفی (هدر X-Telegram-Bot-Api-Secret-Token)
+      if (req.method === 'POST' && req.url === WEBHOOK_PATH) {
+        let body = '';
+        req.on('data', (c) => { body += c; if (body.length > 1e6) req.destroy(); });
+        req.on('end', () => {
+          if (WEBHOOK_SECRET && req.headers['x-telegram-bot-api-secret-token'] !== WEBHOOK_SECRET) {
+            secLog('webhook_forgery', null, `POST جعلی بدون رمز درست از ${req.socket.remoteAddress || '?'}`);
+            res.writeHead(403); res.end(); return;
+          }
+          res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('ok');
+          try {
+            const u = JSON.parse(body);
+            if (u && u.update_id !== undefined) {
+              handleUpdate(u)
+                .then(() => saveDB())
+                .catch((e) => console.error('⚠️ پردازش آپدیت وب‌هوک:', e.message));
+            }
+          } catch (e) { console.error('⚠️ پارس آپدیت وب‌هوک:', e.message); }
+        });
+        return;
+      }
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end(`🤖 Judy bot v${BOT_VERSION} is alive!`);
     }).listen(Number(PORT), () => console.log(`🌐 وب‌سرور Keepalive روی پورت ${PORT} روشن شد`));
